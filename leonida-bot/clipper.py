@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -360,10 +361,12 @@ HOOK_TEMPLATES = [
 ]
 
 
-def make_hook(clip):
-    """Big all-caps line for the top: the clip's title if it's decent, else a catchy template."""
+def pick_hook(clip):
+    """Returns (HOOK IN CAPS for the video, Title text in normal casing). Picked once per clip."""
     import re
-    name = re.sub(r"[^A-Za-z0-9_ ]", "", clip.get("broadcaster_name", "")).upper() or "HE"
+    if "_hook" in clip:
+        return clip["_hook"], clip["_title_text"]
+    display = re.sub(r"[^A-Za-z0-9_ ]", "", clip.get("broadcaster_name", "")) or "He"
     title = clip.get("title", "")
     title = re.sub(r"https?://\S+", "", title)                 # drop links
     title = re.sub(r"[^\x20-\x7E]", "", title)                 # drop emojis / non-latin
@@ -371,11 +374,24 @@ def make_hook(clip):
     words = title.split()
     lowered = re.sub(r"[^a-z ]", "", title.lower()).strip()
     if len(words) >= 3 and lowered not in GENERIC_TITLES:
+        text = title.lower() if title.isupper() else title     # tame ALL-CAPS Twitch titles
+        text = text[0].upper() + text[1:]
+        if display != "He":   # keep the streamer's own spelling (xQc, not Xqc)
+            text = re.sub(rf"\b{re.escape(display)}\b", display, text, flags=re.IGNORECASE)
         hook = title.upper()
         if len(hook) > 60:
             hook = hook[:57].rsplit(" ", 1)[0] + "..."
-        return hook
-    return random.choice(HOOK_TEMPLATES).format(name=name)
+    else:
+        t = random.choice(HOOK_TEMPLATES)
+        hook = t.format(name=display.upper())
+        text = t.format(name="{N}").lower()
+        text = (text[0].upper() + text[1:]).replace("{n}", display)
+    clip["_hook"], clip["_title_text"] = hook, text
+    return hook, text
+
+
+def make_hook(clip):
+    return pick_hook(clip)[0]
 
 
 def build_top_ass(clip, out_path):
@@ -513,23 +529,58 @@ def youtube_service():
     return build("youtube", "v3", credentials=creds)
 
 
+TITLE_EMOJIS = ["💀", "😭", "🔥", "😂", "😳", "🤣", "😱", "", ""]   # "" = sometimes no emoji
+
+DESCRIPTION_STYLES = [
+    "{title}\n\nFull credit to {streamer}, catch the stream at {url}\n\n{tags}",
+    "{streamer} on stream 🎮\nWatch live: {url}\n\n{tags}",
+    "Clipped from {streamer}'s stream ({url}).\nFollow for more {game} moments every day.\n\n{tags}",
+    "{title}\n\nStreamer: {streamer} | {url}\nNew {game} clips daily.\n\n{tags}",
+]
+
+CREDIT_LINES = [
+    "All credit to the streamer. Want a clip taken down? Comment and it'll be removed.",
+    "Clip belongs to the streamer. Ask in the comments and it'll be taken down.",
+    "Credit to the creator. Removal requests in the comments are honored.",
+]
+
+
+def game_labels(cfg):
+    """('GTA 6', '#gta6') from the configured Twitch category."""
+    name = cfg.get("game_name", "")
+    if name.endswith(" VI"):
+        return "GTA 6", "#gta6"
+    if name.endswith(" V"):
+        return "GTA 5", "#gta5"
+    short = re.sub(r"[^A-Za-z0-9]", "", name)
+    return name, "#" + short.lower() if short else "#gaming"
+
+
 def upload_short(yt, video_path, clip, cfg):
     from googleapiclient.http import MediaFileUpload
 
     streamer = clip["broadcaster_name"]
-    title = f"{clip['title']} 😭 #{streamer.lower()} #gta6 #shorts"[:100]
-    description = (
-        f"{clip['title']}\n\n"
-        f"Streamer: {streamer} — https://twitch.tv/{streamer}\n"
-        f"Clip from GTA 6 launch!\n\n"
-        f"{' '.join(cfg.get('hashtags', ['#gta6', '#gta', '#shorts', '#gaming']))}\n\n"
-        f"All rights to the streamer. Contact for removal."
-    )
+    handle = re.sub(r"[^A-Za-z0-9_]", "", streamer).lower()
+    url = f"https://twitch.tv/{handle}" if handle else "https://twitch.tv"
+    game, game_tag = game_labels(cfg)
+    _, title_text = pick_hook(clip)
+
+    emoji = random.choice(TITLE_EMOJIS)
+    title = f"{title_text} {emoji}".strip()
+    if len(title) > 100:
+        title = title[:97].rsplit(" ", 1)[0] + "..."
+
+    extra = random.sample(["#gta", "#shorts", "#gaming", "#twitch", "#funny"], 2)
+    tag_list = [game_tag] + ([f"#{handle}"] if handle else []) + extra   # 3-4 tags, game always correct
+    description = random.choice(DESCRIPTION_STYLES).format(
+        title=title_text, streamer=streamer, url=url, game=game, tags=" ".join(tag_list)
+    ) + "\n\n" + random.choice(CREDIT_LINES)
+
     body = {
         "snippet": {
             "title": title,
             "description": description,
-            "tags": ["gta6", "gta 6", "grand theft auto 6", streamer, "twitch clips", "shorts"],
+            "tags": [game.lower(), game_tag[1:], "grand theft auto", streamer, "twitch clips", "shorts"],
             "categoryId": "20",
         },
         "status": {
