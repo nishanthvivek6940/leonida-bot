@@ -2,11 +2,11 @@
   "twitch_client_id": "set in GitHub Secrets",
   "twitch_client_secret": "set in GitHub Secrets",
 
-  "game_name": "Grand Theft Auto VI",
+  "game_name": "Grand Theft Auto V",
   "streamers": ["kaicenat", "xqc", "caseoh_", "jynxzi", "stableronaldo", "plaqueboymax", "lacy", "yourragegaming", "fanum", "agent00", "hasanabi", "summit1g", "lirik", "moistcr1tikal", "shroud", "sykkuno", "buddha", "sodapoppin", "mizkif", "emiru", "cinna", "loltyler1"],
 
-  "lookback_hours": 6,
-  "min_views": 1000,
+  "lookback_hours": 24,
+  "min_views": 50,
   "max_uploads_per_run": 2,
   "max_clip_seconds": 30,
   "privacy": "public",
