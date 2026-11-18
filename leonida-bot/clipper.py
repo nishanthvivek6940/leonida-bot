@@ -596,6 +596,68 @@ def upload_short(yt, video_path, clip, cfg):
     return resp["id"]
 
 
+# ---------------- Instagram Reels ----------------
+
+IG_API = "https://graph.facebook.com/v27.0"
+IG_UPLOAD = "https://rupload.facebook.com/ig-api-upload/v27.0"
+
+
+def instagram_enabled(cfg):
+    return cfg.get("instagram", True) and os.environ.get("IG_USER_ID") and os.environ.get("IG_ACCESS_TOKEN")
+
+
+def post_reel(video_path, caption):
+    """Upload a local video as an Instagram Reel (Facebook Login resumable upload). Returns media id."""
+    import time
+    ig_id, token = os.environ["IG_USER_ID"], os.environ["IG_ACCESS_TOKEN"]
+    auth = {"Authorization": f"OAuth {token}"}
+
+    # 1. create an upload container
+    r = requests.post(f"{IG_API}/{ig_id}/media", headers=auth, timeout=60, data={
+        "media_type": "REELS", "upload_type": "resumable",
+        "caption": caption[:2200], "share_to_feed": "true",
+    })
+    r.raise_for_status()
+    container = r.json()["id"]
+
+    # 2. send the video file
+    data = Path(video_path).read_bytes()
+    r = requests.post(f"{IG_UPLOAD}/{container}", timeout=600, data=data,
+                      headers={**auth, "offset": "0", "file_size": str(len(data))})
+    r.raise_for_status()
+
+    # 3. wait for Instagram to finish processing
+    for _ in range(60):                       # up to ~10 minutes
+        st = requests.get(f"{IG_API}/{container}", headers=auth, timeout=30,
+                          params={"fields": "status_code,status"}).json()
+        code = st.get("status_code")
+        if code == "FINISHED":
+            break
+        if code in ("ERROR", "EXPIRED"):
+            raise RuntimeError(f"Instagram processing failed: {st.get('status')}")
+        time.sleep(10)
+    else:
+        raise RuntimeError("Instagram processing timed out")
+
+    # 4. publish
+    r = requests.post(f"{IG_API}/{ig_id}/media_publish", headers=auth, timeout=60,
+                      data={"creation_id": container})
+    r.raise_for_status()
+    return r.json()["id"]
+
+
+def reel_caption(clip, cfg):
+    streamer = clip["broadcaster_name"]
+    handle = re.sub(r"[^A-Za-z0-9_]", "", streamer).lower()
+    game, game_tag = game_labels(cfg)
+    _, title_text = pick_hook(clip)
+    emoji = random.choice(TITLE_EMOJIS)
+    tags = " ".join([game_tag, "#gta", f"#{handle}" if handle else "#twitch", "#gaming", "#reels"])
+    return (f"{title_text} {emoji}".strip()
+            + f"\n\n🎥 {streamer} on Twitch (twitch.tv/{handle})\nFollow for daily {game} clips\n\n{tags}"
+            + "\n\nAll credit to the streamer. DM for removal.")
+
+
 # ---------------- Main ----------------
 
 def main():
@@ -634,6 +696,13 @@ def main():
             else:
                 vid = upload_short(yt, short, clip, cfg)
                 log(f"uploaded: https://youtube.com/shorts/{vid}")
+                if instagram_enabled(cfg):
+                    try:
+                        rid = post_reel(short, reel_caption(clip, cfg))
+                        log(f"instagram reel posted: {rid}")
+                    except Exception as e:      # Instagram trouble never blocks YouTube
+                        detail = getattr(getattr(e, "response", None), "text", "")[:300]
+                        log(f"instagram failed: {e} {detail}")
                 # only real uploads count as posted — test runs can reuse clips
                 history["posted_clip_ids"].append(clip["id"])
                 save_history(history)
