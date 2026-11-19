@@ -156,11 +156,26 @@ def fetch_clips(cfg, token):
             seen.add(c["id"])
             unique.append(c)
     log(f"clips from Twitch ({cfg.get('game_name')}, last {cfg.get('lookback_hours', 6)}h): {len(unique)}")
-    unique = [c for c in unique if c["view_count"] >= cfg.get("min_views", 1000)]
-    log(f"  after min views ({cfg.get('min_views', 1000)}+): {len(unique)}")
-    # big names first: streamers on your list always count, anyone else only if the clip went viral
+    # judge by SPEED, not total: a 20-minute-old clip can't have 1000 views yet.
+    # need = min_views scaled by age (full amount once the clip is `ramp_hours` old), never below the floor
+    now = datetime.now(timezone.utc)
+    ramp = cfg.get("ramp_hours", 3)
+    floor = cfg.get("min_fresh_views", 150)
+    for c in unique:
+        try:
+            made = datetime.strptime(c["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            age_h = max(0.1, (now - made).total_seconds() / 3600)
+        except Exception:
+            age_h = ramp
+        c["_age_h"] = age_h
+        c["_vph"] = c["view_count"] / age_h                    # views per hour = how hot it is
+        c["_need"] = max(floor, cfg.get("min_views", 1000) * min(1.0, age_h / ramp))
+    unique = [c for c in unique if c["view_count"] >= c["_need"]]
+    log(f"  after min views (scaled by age, {floor}+ when fresh): {len(unique)}")
+    # big names first: streamers on your list always count, anyone else only if the clip is blowing up
     viral = cfg.get("category_min_views", 20000)
-    unique = [c for c in unique if c.get("broadcaster_id") in list_ids or c["view_count"] >= viral]
+    unique = [c for c in unique if c.get("broadcaster_id") in list_ids or c["view_count"] >= viral
+              or c["_vph"] >= viral / ramp]
     log(f"  after big-streamer filter (your list, or {viral}+ views): {len(unique)}")
     max_len = cfg.get("max_clip_seconds", 30)
     unique = [c for c in unique if 5 <= c.get("duration", 0) <= max_len]
@@ -179,7 +194,7 @@ def fetch_clips(cfg, token):
         else:
             tier = 2
         c["_tier"], c["_rank"] = tier, rank.get(bid, 999)
-        return (tier, rank.get(bid, 999), -c["view_count"])
+        return (tier, rank.get(bid, 999), -c.get("_vph", c["view_count"]))
     unique.sort(key=priority)
     return unique
 
@@ -765,7 +780,7 @@ def score_moment(raw, clip, cfg):
     ladder = {0: 4, 1: 1.5}.get(clip.get("_tier", 2), 0)        # 6. ranked + live streamers get a head start
     ladder += max(0, 2 - clip.get("_rank", 999) * 0.1)
     cam_bonus = cfg.get("facecam_bonus", 4) if clip["_cam"] else 0
-    score = moment + ladder + cam_bonus + math.log10(max(clip["view_count"], 1))
+    score = moment + ladder + cam_bonus + math.log10(max(clip.get("_vph", clip["view_count"]), 1))
     clip["_why"] = (f"talk {talking:+.1f} ({len(words)} words), react {reaction:.1f}, chaos {chaos:.1f}, fail {fail}, funny {funny}, "
                     f"hype {hype}, loud {excite:.1f}" + (f', quote "{clip["_quote"]}"' if clip["_quote"] else ""))
     return round(score, 1), category
@@ -1268,6 +1283,11 @@ def main():
     log("=== run started ===")
     token = twitch_token(cfg)
     clips = fetch_clips(cfg, token)
+    done = set(history["posted_clip_ids"]) | set(history.get("skipped_clip_ids", []))
+    fallback = cfg.get("fallback_lookback_hours", 12)
+    if not [c for c in clips if c["id"] not in done] and fallback > cfg.get("lookback_hours", 6):
+        log(f"nothing fresh: looking back {fallback}h instead")
+        clips = fetch_clips({**cfg, "lookback_hours": fallback}, token)
     log(f"found {len(clips)} candidate clips")
 
     done = set(history["posted_clip_ids"]) | set(history.get("skipped_clip_ids", []))
