@@ -137,7 +137,8 @@ def fetch_clips(cfg, token):
         for uid in new_ids:
             clips += twitch_get(cfg, token, "clips",
                                 {"broadcaster_id": uid, "started_at": started_at, "first": 20})
-        list_ids |= {st["user_id"] for st in live_big}
+        if cfg.get("trust_big_live", False):           # off: someone not on your list needs a clip that's blowing up
+            list_ids |= {st["user_id"] for st in live_big}
         if live_big:
             names = ", ".join(f"{st['user_name']} ({st['viewer_count']:,})" for st in live_big[:8])
             log(f"big live streamers right now: {names}")
@@ -551,6 +552,9 @@ def make_captions(src, clip, cfg):
     """Returns path to .ass subtitle file, or None."""
     if not cfg.get("captions", True):
         return None
+    if not clip.get("_cam") and not cfg.get("captions_without_cam", False):
+        log("  captions: off (no face-cam, can't tell the streamer from game voices)")
+        return None
     try:
         words = transcribe_words(src, cfg.get("caption_timeout", 240))
         words = streamer_words_only(words, src, clip, cfg)
@@ -958,6 +962,7 @@ def score_moment(raw, clip, cfg):
     if all_words > len(words):
         log(f"  ({all_words - len(words)} of {all_words} words were the game talking, ignored)")
     text = " " + " ".join(w for w, _, _ in words).lower() + " "
+    clip["_said"] = " ".join(w for w, _, _ in words) if clip["_cam"] else ""
     title = clip.get("title", "").lower()
     funny = sum(text.count(f" {w}") for w in FUNNY_WORDS) + 2 * sum(k in title for k in TITLE_FUNNY)
     fail = sum(text.count(f" {w}") for w in FAIL_WORDS)                       # 3. fails / karma
@@ -985,7 +990,7 @@ def score_moment(raw, clip, cfg):
     density = len(words) / dur                             # words per second
     group = max(0.0, density - 2.5)
     # 5. a quotable one-liner near the payoff
-    clip["_quote"] = best_quote(words, peak_i * 0.1 if peak_i is not None else None)
+    clip["_quote"] = best_quote(words, peak_i * 0.1 if peak_i is not None else None) if clip["_cam"] else ""
     quote = 3.0 if clip["_quote"] else 0.0
     # the streamer's voice is half the joke: silent clips lose, talking / yelling clips win
     talk_secs = sum(b - a for _, a, b in words)
@@ -993,6 +998,8 @@ def score_moment(raw, clip, cfg):
         talking = -cfg.get("silent_penalty", 8)          # barely says anything
     else:
         talking = min(len(words) / 10, 2.0) + (1.5 if excite >= 1.5 and words else 0)
+    if not clip["_cam"]:
+        talking = min(talking, 0.0)                    # no cam: those words might all be the game
 
     moment = (1.5 * min(funny, 8) + 2.0 * min(fail, 5) + 1.5 * min(hype, 8) + 2 * min(excite, 4)
               + 1.5 * min(reaction, 4) + 1.0 * min(chaos, 4) + 1.0 * min(group, 3) + quote + talking)
@@ -1071,11 +1078,12 @@ def make_hook(clip):
     return pick_hook(clip)[0]
 
 
-def build_top_ass(clip, out_path, split=False):
+def build_top_ass(clip, out_path, split=False, hook=True):
     """Streamer name (small) + hook line (big, wraps to 2 lines) in the top blurred area."""
     import re
     def esc(t):
         return t.replace("\\", "").replace("{", "(").replace("}", ")")
+    show_hook = hook
     name = re.sub(r"[^A-Za-z0-9_ ]", "", clip.get("broadcaster_name", "")).upper()
     hook = esc(make_hook(clip))
     header = (
@@ -1093,7 +1101,8 @@ def build_top_ass(clip, out_path, split=False):
     pop = r"{\fscx70\fscy70\t(0,120,\fscx105\fscy105)\t(120,200,\fscx100\fscy100)}"
     if split:   # sit the hook right on the line between face-cam and gameplay
         pop = r"{\an5\pos(540,672)\fs92}" + pop
-    lines.append(f"Dialogue: 0,0:00:00.00,9:59:59.00,Hook,{pop}{hook}")
+    if show_hook:
+        lines.append(f"Dialogue: 0,0:00:00.00,9:59:59.00,Hook,{pop}{hook}")
     out_path.write_text(header + "\n".join(lines))
     return out_path
 
@@ -1158,7 +1167,7 @@ def _find_facecam(src):
         keep = []
         for (x, y, w, h) in found:
             cx, cy = x + w / 2, y + h / 2
-            edge = cx < W * 0.35 or cx > W * 0.65 or cy < H * 0.28 or cy > H * 0.72
+            edge = cx < W * 0.3 or cx > W * 0.7          # webcams live at the sides, characters in the middle
             if edge and w < H * 0.4:
                 keep.append((int(x), int(y), int(w), int(h)))
         dets.append(keep)
@@ -1188,9 +1197,16 @@ def _find_facecam(src):
     x = min(max(0, cx - cw / 2), W - cw)
     y = min(max(0, cy - ch / 2), H - ch)
     ev = lambda v: int(v) // 2 * 2
+    box = (ev(x), ev(y), ev(cw), ev(ch))
+    # real webcam = a room that barely moves; a game scene keeps moving / cutting between shots
+    cam_m, frame_m = motion_profile(src, box), motion_profile(src)
+    if cam_m and frame_m:
+        med = lambda v: sorted(v)[len(v) // 2]
+        if med(cam_m) > 1.3 * max(med(frame_m), 0.3):
+            return None                               # that "face" was a game character, not a webcam
     global _LAST_FACE
     _LAST_FACE = (fx, fy, fw, fh)                     # the face itself (for the mouth check)
-    return ev(x), ev(y), ev(cw), ev(ch), ev(W), ev(H)
+    return box[0], box[1], box[2], box[3], ev(W), ev(H)
 
 
 def make_vertical(src, clip, cfg):
@@ -1244,7 +1260,18 @@ def make_vertical(src, clip, cfg):
         vf += f";{last_v}ass='{ass}':fontsdir='{FONTS}'[vcap]"
         last_v = "[vcap]"
 
-    top = build_top_ass(clip, SHORTS / f"{clip['id']}_top.ass", split=clip.get("_split", False))
+    hook_png = None
+    if "_hook" not in clip:
+        ai = ai_meme_caption(src, clip, cfg)
+        if ai:
+            clip["_hook"], clip["_title_text"] = ai
+            try:
+                hook_png, (pw, ph) = render_hook_png(ai[0], SHORTS / f"{clip['id']}_hook.png")
+            except Exception as e:
+                log(f"  (couldn't draw the AI caption: {e})")
+                hook_png = None
+    top = build_top_ass(clip, SHORTS / f"{clip['id']}_top.ass", split=clip.get("_split", False),
+                        hook=not hook_png)
     vf += f";{last_v}ass='{top}':fontsdir='{FONTS}'[vtop]"
     last_v = "[vtop]"
 
@@ -1266,6 +1293,13 @@ def make_vertical(src, clip, cfg):
         )
         audio_parts[0] = "[voice]"
         audio_parts.append("[m]")
+        n_in += 1
+
+    if hook_png:                               # the AI meme caption, on the face-cam/game line (or top)
+        cmd += ["-loop", "1", "-i", str(hook_png)]
+        hy = int(672 - ph / 2) if clip.get("_split") else 150
+        vf += f";{last_v}[{n_in}:v]overlay=(W-w)/2:{hy}:shortest=1[vhook]"
+        last_v = "[vhook]"
         n_in += 1
 
     for k, q in enumerate(peaks):              # a bass "boom" on each big moment
@@ -1295,10 +1329,149 @@ def make_vertical(src, clip, cfg):
     try:
         subprocess.run(cmd, check=True, timeout=900)
     finally:
-        for f in (top, ass):
+        for f in (top, ass, hook_png):
             if f:
-                Path(f).unlink(missing_ok=True)   # temp text files, not needed after render
+                Path(f).unlink(missing_ok=True)   # temp files, not needed after render
     return out
+
+
+# ---------------- AI meme captions (free, GitHub Models) ----------------
+
+AI_URL = "https://models.github.ai/inference/chat/completions"
+AI_STYLE = """You write the on-screen caption for viral GTA 6 streamer clips on Instagram Reels / YouTube Shorts.
+Style = meme clip pages: a short POV or relatable joke ABOUT what happens, not a plain description.
+Examples of the vibe:
+- "Pov: Bro After 22 Hours Non-Stop."
+- "Pov: Gold Digger.. GTA 6"
+- "They didn't let me press it..? 😭"
+- "Speed when the cops pull up ☠️"
+- "Wtf bruh what is this..? 😭"
+Rules: 3-10 words, sentence case, 1-2 emojis from 😭 💀 ☠️ 😂 🔥 🌽 🤣 😳 at the end, no hashtags,
+no quotes around it, nothing hateful, no slurs, swear words censored (f***). Use the streamer's name only
+if it makes the joke better. Base it on what you SEE in the frames and what the streamer SAYS.
+Reply with JSON only: {"hook": "...", "title": "..."} where title is a YouTube title (max 70 chars)
+that starts with the hook and naturally includes the streamer name and "GTA 6"."""
+
+
+def ai_meme_caption(src, clip, cfg):
+    """Ask a free AI model (GitHub Models) for a POV-style meme caption. Returns (hook, title) or None."""
+    import base64, tempfile
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token or not cfg.get("ai_captions", True):
+        return None
+    # 3 frames: before, at, and after the big moment
+    rms = rms_profile(src)
+    dur = len(rms) * 0.1 or 10
+    peak = find_peak(src) or dur / 2
+    images = []
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        for k, t in enumerate([max(0.2, peak - 3), peak + 0.3, min(dur - 0.2, peak + 3)]):
+            jpg = tmp / f"f{k}.jpg"
+            subprocess.run([ffmpeg_path(), "-v", "error", "-y", "-ss", f"{t:.2f}", "-i", str(src),
+                            "-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "5", str(jpg)], timeout=60)
+            if jpg.exists():
+                images.append(base64.b64encode(jpg.read_bytes()).decode())
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+    said = clip.get("_said", "").strip() or "(nothing clear / mostly silent)"
+    info = (f"Streamer: {clip.get('broadcaster_name')}\nTwitch clip title: {clip.get('title', '')}\n"
+            f"What the streamer says: {said[:600]}\nThe 3 frames are before / during / after the moment.")
+    content = [{"type": "text", "text": info}] + [
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b}", "detail": "low"}} for b in images]
+    body = {"model": cfg.get("ai_model", "openai/gpt-4o-mini"), "temperature": 0.9,
+            "messages": [{"role": "system", "content": AI_STYLE}, {"role": "user", "content": content}]}
+    try:
+        r = requests.post(AI_URL, json=body, timeout=60, headers={
+            "Authorization": f"Bearer {token}", "Content-Type": "application/json",
+            "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"})
+        r.raise_for_status()
+        txt = r.json()["choices"][0]["message"]["content"]
+        m = re.search(r"\{.*\}", txt, re.S)
+        data = json.loads(m.group(0)) if m else {}
+        hook = clean_word(str(data.get("hook", "")).strip().strip('"'))
+        title = clean_word(str(data.get("title", "")).strip().strip('"')) or hook
+        if not 2 <= len(hook.split()) <= 14:
+            return None
+        log(f"  AI caption: {hook}")
+        return hook, title[:100]
+    except Exception as e:
+        log(f"  (AI caption failed: {str(e)[:120]}; using the normal hook)")
+        return None
+
+
+def _is_emoji(ch):
+    o = ord(ch)
+    return o >= 0x2600 and not (0x3000 <= o <= 0x30FF) or o in (0x200D, 0xFE0F)
+
+
+def render_hook_png(text, out_path, width=1000):
+    """Draw the hook like meme pages do: white text, thick black outline, real colour emojis."""
+    from PIL import Image, ImageDraw, ImageFont
+    size = 78
+    font = ImageFont.truetype(str(FONTS / "Anton-Regular.ttf"), size)
+    emoji_font = None
+    for p in ["/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf", "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+              "/System/Library/Fonts/Apple Color Emoji.ttc"]:
+        if Path(p).exists():
+            try:
+                emoji_font = ImageFont.truetype(p, 109)
+                break
+            except Exception:
+                pass
+    # split into words; each word = list of (is_emoji, text) pieces
+    words = []
+    for w in text.split():
+        pieces, cur, cur_e = [], "", None
+        for ch in w:
+            if ch in ("\ufe0f", "\u200d"):
+                continue
+            e = _is_emoji(ch)
+            if cur and e != cur_e:
+                pieces.append((cur_e, cur))
+                cur = ""
+            cur, cur_e = cur + ch, e
+        if cur:
+            pieces.append((cur_e, cur))
+        words.append(pieces)
+    space = font.getlength(" ")
+    def piece_w(e, t):
+        return size * 1.05 * len(t) if e else font.getlength(t)
+    word_w = lambda pcs: sum(piece_w(e, t) for e, t in pcs)
+    lines, cur, cur_w = [], [], 0
+    for pcs in words:
+        w = word_w(pcs)
+        if cur and cur_w + space + w > width - 40:
+            lines.append(cur)
+            cur, cur_w = [], 0
+        cur.append(pcs)
+        cur_w += (space if cur_w else 0) + w
+    if cur:
+        lines.append(cur)
+    line_h = int(size * 1.25)
+    img = Image.new("RGBA", (width, line_h * len(lines) + 30), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    y = 10
+    for ln in lines:
+        total = sum(word_w(p) for p in ln) + space * (len(ln) - 1)
+        x = (width - total) / 2
+        for pcs in ln:
+            for e, t in pcs:
+                if e and emoji_font:
+                    for ch in t:
+                        g = Image.new("RGBA", (136, 128), (0, 0, 0, 0))
+                        ImageDraw.Draw(g).text((0, 0), ch, font=emoji_font, embedded_color=True)
+                        g = g.crop(g.getbbox() or (0, 0, 1, 1)).resize((int(size * 0.95), int(size * 0.95)))
+                        img.alpha_composite(g, (int(x), int(y + size * 0.12)))
+                        x += size * 1.05
+                elif not e:
+                    d.text((x, y), t, font=font, fill="white", stroke_width=7, stroke_fill="black")
+                    x += font.getlength(t)
+            x += space
+        y += line_h
+    img.save(out_path)
+    return out_path, img.size
 
 
 # ---------------- YouTube ----------------
@@ -1377,7 +1550,7 @@ def post_text(clip, cfg):
     _, text = pick_hook(clip)
     if streamer != raw_name:      # "KaiCenat was..." -> "Kai Cenat was..."
         text = re.sub(rf"\b{re.escape(raw_name.rstrip('_'))}_?\b", streamer, text, flags=re.IGNORECASE)
-    emoji = random.choice(TITLE_EMOJIS)
+    emoji = "" if any(_is_emoji(ch) for ch in text) else random.choice(TITLE_EMOJIS)
 
     # searchable suffix: "| Kai Cenat GTA 6", without repeating what the hook already says
     has_name = streamer.lower() in text.lower() or raw_name.lower() in text.lower()
