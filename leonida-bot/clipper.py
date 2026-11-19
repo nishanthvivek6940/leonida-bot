@@ -288,11 +288,15 @@ audio = np.frombuffer(raw, np.int16).astype(np.float32) / 32768.0
 m = WhisperModel("base", device="cpu", compute_type="int8")
 segs, _ = m.transcribe(audio, word_timestamps=True, language="en")
 out = []
-for seg in segs:
-    for w in seg.words or []:
-        t = w.word.strip()
-        if t:
-            out.append([t, w.start, w.end])
+try:
+    for seg in segs:
+        for w in seg.words or []:
+            t = w.word.strip()
+            if t:
+                out.append([t, w.start, w.end])
+except Exception as e:
+    # whisper sometimes trips on a weird bit of audio; keep the words we already got
+    sys.stderr.write(f"partial transcript: {type(e).__name__}: {e}\n")
 print(json.dumps(out))
 """
 
@@ -601,6 +605,15 @@ def find_peaks(src, n=3, gap=3.0):
 
 
 def find_facecam(src):
+    """Never let face detection kill a clip: on any error, fall back to the blur layout."""
+    try:
+        return _find_facecam(src)
+    except Exception as e:
+        log(f"  (face-cam check failed: {type(e).__name__}: {e})")
+        return None
+
+
+def _find_facecam(src):
     """Find the streamer's webcam: a face that stays in the same spot across the clip.
     Returns (x, y, w, h, W, H) crop box in source pixels, or None."""
     try:
