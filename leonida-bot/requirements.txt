@@ -6,3 +6,4 @@ google-auth-oauthlib
 google-auth-httplib2
 faster-whisper
 opencv-python-headless<5
+nudenet
