@@ -72,7 +72,7 @@ jobs:
           git config user.name "leonida-bot"
           git config user.email "leonida-bot@users.noreply.github.com"
           git add posted.json 2>/dev/null || true
-          git diff --cached --quiet || (git commit -m "posted clips update" && git push)
+                    git diff --cached --quiet || (git commit -m "posted clips update" && git pull --rebase -X theirs && git push)
 
       - name: Keep the shorts and log for 7 days
         if: always()
