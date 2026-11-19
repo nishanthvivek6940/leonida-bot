@@ -381,12 +381,46 @@ def build_ass(words, out_path):
     return out_path
 
 
+def streamer_words_only(words, src, clip, cfg):
+    """Drop lines spoken by the game (cutscenes, NPCs). Trick: when the streamer talks, their
+    face on the cam moves; when a game character talks, the streamer is usually just watching."""
+    cam = clip.get("_cam")
+    if not cam or not words or not cfg.get("skip_game_captions", True):
+        return words
+    x, y, w, h, _, _ = cam
+    motion = motion_profile(src, (x, y, w, h))
+    if len(motion) < 10:
+        return words
+    base = sorted(motion)[len(motion) // 2] or 1e-6          # typical face movement in this clip
+    factor = cfg.get("game_voice_factor", 0.6)
+    lines, cur = [], []
+    for wd in words:                                        # group into lines (pause = new line)
+        if cur and wd[1] - cur[-1][2] > 0.6:
+            lines.append(cur)
+            cur = []
+        cur.append(wd)
+    if cur:
+        lines.append(cur)
+    keep, dropped = [], 0
+    for ln in lines:
+        a, b = int(ln[0][1] * 10), int(ln[-1][2] * 10) + 1
+        seg = motion[a:b] or [base]
+        if sum(seg) / len(seg) < base * factor:             # face basically still = game talking
+            dropped += 1
+            continue
+        keep += ln
+    if dropped:
+        log(f"  captions: skipped {dropped} game-voice line(s)")
+    return keep
+
+
 def make_captions(src, clip, cfg):
     """Returns path to .ass subtitle file, or None."""
     if not cfg.get("captions", True):
         return None
     try:
         words = transcribe_words(src, cfg.get("caption_timeout", 240))
+        words = streamer_words_only(words, src, clip, cfg)
         if not words:
             return None
         ass = SHORTS / f"{clip['id']}.ass"
@@ -483,13 +517,47 @@ def snap_to_speech(start, end, words, dur, cfg):
     return round(start, 2), round(end, 2)
 
 
-def plan_cuts(rms, peak, cfg, words=None, motion=None):
+def let_it_finish(end, rms, dur, cfg, motion=None, face=None):
+    """Keep going until the moment is REALLY over. Funny can be quiet (a frozen stare, silent
+    wheezing, the game doing something dumb), so we only stop when ALL THREE are calm for ~1.5 s:
+    the sound, the streamer's face-cam, and the gameplay. No such dead stretch = play to the end
+    (the person who made the Twitch clip already chose a good ending)."""
+    if not rms:
+        return end
+    def calm_line(vals, factor):
+        if not vals or len(vals) < 10:
+            return None
+        busy = sorted(vals)[int(len(vals) * 0.75)] or 1e-6   # how much it moves when stuff happens
+        return [v < busy * factor for v in vals]
+    mean = sum(rms) / len(rms) or 1
+    sound_calm = [v < mean * cfg.get("still_funny_level", 0.9) for v in rms]
+    game_calm = calm_line(motion, 0.5)
+    face_calm = calm_line(face, 0.5)
+    need = int(cfg.get("dead_seconds_to_stop", 1.5) * 10)
+    run = 0
+    for i in range(int(end * 10), len(rms)):
+        calm = sound_calm[i]
+        if game_calm is not None and i < len(game_calm):
+            calm = calm and game_calm[i]
+        if face_calm is not None and i < len(face_calm):
+            calm = calm and face_calm[i]
+        run = run + 1 if calm else 0
+        if run >= need:                                  # truly dead: end just after it went calm
+            stop = (i - run + 1) * 0.1 + 0.6
+            stop = max(end, min(dur, stop))
+            return dur if dur - stop < cfg.get("play_to_end_seconds", 4) else round(stop, 2)
+    return dur                                           # never went fully dead: play the whole thing
+
+
+def plan_cuts(rms, peak, cfg, words=None, motion=None, face=None):
     """Which parts of the clip to keep: short build-up, the payoff, the reaction; no boring bits.
     Boring = dead quiet, OR fairly quiet while nothing much moves on screen. Speech is never cut."""
     dur = len(rms) * 0.1
     pre = cfg.get("max_buildup_seconds", 10)
-    post = cfg.get("after_payoff_seconds", 5)
+    post = cfg.get("after_payoff_seconds", 6)
     start, end = max(0.0, peak - pre), min(dur, peak + post)
+    start, end = snap_to_speech(start, end, words, dur, cfg)
+    end = let_it_finish(end, rms, dur, cfg, motion, face)
     start, end = snap_to_speech(start, end, words, dur, cfg)
 
     # dead air = quiet stretches before the payoff (quiet = under 35% of the clip's average loudness)
@@ -541,7 +609,11 @@ def tighten_clip(src, clip, cfg):
     except Exception:
         words = []
     motion = motion_profile(src)
-    keep = plan_cuts(rms, peak, cfg, words, motion)
+    face = []
+    if clip.get("_cam"):                                 # the streamer's face-cam movement
+        x, y, w, h, _, _ = clip["_cam"]
+        face = motion_profile(src, (x, y, w, h))
+    keep = plan_cuts(rms, peak, cfg, words, motion, face)
     dur = len(rms) * 0.1
 
     # teaser: flash the payoff first ("how did we get here"), only if the payoff is far enough in
