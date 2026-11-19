@@ -1667,6 +1667,23 @@ IG_API = "https://graph.facebook.com/v27.0"
 IG_UPLOAD = "https://rupload.facebook.com/ig-api-upload/v27.0"
 
 
+SEXY_WORDS = ["strip club", "stripper", "strip", "lap dance", "lapdance", "naked", "nude", "sex", "gyatt",
+              "hooker", "boob", "booty", "twerk", "onlyfans", "porn", "por*", "nsfw", "thirst", "brothel",
+              "escort", "hoe", "freak", "lust", "gold digger", "bedroom"]
+
+
+def instagram_safe(clip, cfg):
+    """Instagram strikes accounts for nudity AND sexual scenes even when blurred, so anything
+    with nudity or a sexual-sounding title/speech skips Instagram (it still goes to YouTube)."""
+    if clip.get("_nude", 0) > cfg.get("ig_nudity_limit", 0.0):
+        return False, "nudity in the clip"
+    text = (clip.get("title", "") + " " + clip.get("_said", "") + " " + clip.get("_title_text", "")).lower()
+    hit = next((w for w in SEXY_WORDS if re.search(rf"\b{re.escape(w)}", text)), None)
+    if hit:
+        return False, f'sexual word "{hit}"'
+    return True, ""
+
+
 def instagram_enabled(cfg):
     return cfg.get("instagram", True) and os.environ.get("IG_USER_ID") and os.environ.get("IG_ACCESS_TOKEN")
 
@@ -1775,6 +1792,7 @@ def main():
             raw = download_clip(c, cfg)
             mode = cfg.get("nudity", "blur")
             nude = nudity_fraction(raw, cfg) if mode in ("blur", "skip") else 0.0
+            c["_nude"] = nude
             too_much = nude > 0.05 if mode == "skip" else nude >= cfg.get("nudity_skip_fraction", 1.01)
             if too_much:                                  # mostly nude (strip club etc.) = skip; a quick moment gets blurred later
                 log(f"  skip (nudity in {nude:.0%} of clip) {c['broadcaster_name']} - {c['title'][:50]}")
@@ -1829,7 +1847,10 @@ def main():
             else:
                 vid = upload_short(yt, short, clip, cfg)
                 log(f"uploaded: https://youtube.com/shorts/{vid}")
-                if instagram_enabled(cfg):
+                ok_ig, why = instagram_safe(clip, cfg)
+                if instagram_enabled(cfg) and not ok_ig:
+                    log(f"instagram: skipped this one ({why}) - Instagram strikes sexual content even blurred")
+                elif instagram_enabled(cfg):
                     try:
                         rid = post_reel(short, reel_caption(clip, cfg))
                         log(f"instagram reel posted: {rid}")
