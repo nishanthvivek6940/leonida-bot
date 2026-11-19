@@ -106,14 +106,42 @@ def fetch_clips(cfg, token):
         game_id = get_game_id(cfg, token, cfg["game_name"])
 
     broadcasters = cfg.get("streamers", [])
+    list_ids = set()
+    rank = {}                                   # broadcaster_id -> position in your ranked list (0 = top)
+    live_ids = set()                            # list streamers live in this game right now
     if broadcasters:
         users = twitch_get(cfg, token, "users", [("login", b.lower()) for b in broadcasters])
+        list_ids = {u["id"] for u in users}
+        order = {b.lower(): i for i, b in enumerate(broadcasters)}
+        rank = {u["id"]: order.get(u["login"].lower(), 999) for u in users}
+        if game_id and users:
+            live = twitch_get(cfg, token, "streams", [("user_id", u["id"]) for u in users])
+            live_ids = {st["user_id"] for st in live if st.get("game_id") == game_id}
+            if live_ids:
+                on = sorted((rank[i], st["user_name"]) for st in live for i in [st["user_id"]] if i in live_ids)
+                log("ranked streamers live now: " + ", ".join(f"#{r + 1} {n}" for r, n in on))
         for u in users:
             clips += twitch_get(
                 cfg, token, "clips",
                 {"broadcaster_id": u["id"], "started_at": started_at, "first": 20},
             )
     if game_id:
+        # whoever is BIG right now: top live English streams in this game with lots of viewers
+        min_viewers = cfg.get("big_streamer_min_viewers", 5000)
+        live = twitch_get(cfg, token, "streams",
+                          {"game_id": game_id, "language": cfg.get("language", "en"), "first": 100})
+        live_big = [st for st in live if st.get("viewer_count", 0) >= min_viewers]
+        live_big.sort(key=lambda st: st["viewer_count"], reverse=True)
+        live_big = live_big[: cfg.get("max_live_streamers", 15)]
+        new_ids = [st["user_id"] for st in live_big if st["user_id"] not in list_ids]
+        for uid in new_ids:
+            clips += twitch_get(cfg, token, "clips",
+                                {"broadcaster_id": uid, "started_at": started_at, "first": 20})
+        list_ids |= {st["user_id"] for st in live_big}
+        if live_big:
+            names = ", ".join(f"{st['user_name']} ({st['viewer_count']:,})" for st in live_big[:8])
+            log(f"big live streamers right now: {names}")
+
         clips += twitch_get(
             cfg, token, "clips",
             {"game_id": game_id, "started_at": started_at, "first": 50},
@@ -130,6 +158,10 @@ def fetch_clips(cfg, token):
     log(f"clips from Twitch ({cfg.get('game_name')}, last {cfg.get('lookback_hours', 6)}h): {len(unique)}")
     unique = [c for c in unique if c["view_count"] >= cfg.get("min_views", 1000)]
     log(f"  after min views ({cfg.get('min_views', 1000)}+): {len(unique)}")
+    # big names first: streamers on your list always count, anyone else only if the clip went viral
+    viral = cfg.get("category_min_views", 20000)
+    unique = [c for c in unique if c.get("broadcaster_id") in list_ids or c["view_count"] >= viral]
+    log(f"  after big-streamer filter (your list, or {viral}+ views): {len(unique)}")
     max_len = cfg.get("max_clip_seconds", 30)
     unique = [c for c in unique if 5 <= c.get("duration", 0) <= max_len]
     log(f"  after length (5-{max_len}s): {len(unique)}")
@@ -137,7 +169,18 @@ def fetch_clips(cfg, token):
     if lang:
         unique = [c for c in unique if c.get("language", "").startswith(lang)]
         log(f"  after language ({lang}): {len(unique)}")
-    unique.sort(key=lambda c: c["view_count"], reverse=True)
+    # hierarchy: ranked + live first (in rank order), then ranked but offline, then everyone else
+    def priority(c):
+        bid = c.get("broadcaster_id")
+        if bid in rank and bid in live_ids:
+            tier = 0
+        elif bid in rank:
+            tier = 1
+        else:
+            tier = 2
+        c["_tier"], c["_rank"] = tier, rank.get(bid, 999)
+        return (tier, rank.get(bid, 999), -c["view_count"])
+    unique.sort(key=priority)
     return unique
 
 
@@ -322,8 +365,8 @@ def make_captions(src, clip, cfg):
         return None
 
 
-def find_peak(src):
-    """Time (s) of the loudest moment, or None if the clip has no clear spike."""
+def rms_profile(src, win_s=0.1):
+    """Loudness of each 0.1 s slice of the clip's audio."""
     import array, math
     try:
         r = subprocess.run(
@@ -333,12 +376,18 @@ def find_peak(src):
         )
         samples = array.array("h", r.stdout)
     except Exception:
-        return None
-    win = 800  # 0.1 s windows
-    rms = []
+        return []
+    win = int(8000 * win_s)
+    out = []
     for i in range(0, len(samples) - win, win):
         chunk = samples[i:i + win]
-        rms.append(math.sqrt(sum(x * x for x in chunk) / win))
+        out.append(math.sqrt(sum(x * x for x in chunk) / win))
+    return out
+
+
+def find_peak(src):
+    """Time (s) of the loudest moment, or None if the clip has no clear spike."""
+    rms = rms_profile(src)
     if len(rms) < 10:
         return None
     mean = sum(rms) / len(rms)
@@ -348,8 +397,118 @@ def find_peak(src):
     return max(0.0, peak_i * 0.1 - 0.05)
 
 
+def plan_cuts(rms, peak, cfg):
+    """Which parts of the clip to keep: short build-up, the payoff, the reaction; no dead air."""
+    dur = len(rms) * 0.1
+    pre = cfg.get("max_buildup_seconds", 10)
+    post = cfg.get("after_payoff_seconds", 4)
+    start, end = max(0.0, peak - pre), min(dur, peak + post)
+
+    # dead air = quiet stretches before the payoff (quiet = under 35% of the clip's average loudness)
+    mean = sum(rms) / len(rms)
+    quiet = [v < mean * 0.35 for v in rms]
+    min_gap = cfg.get("min_dead_air_seconds", 0.8)
+    keep, cur = [], start
+    i = int(start * 10)
+    stop = int(max(start, peak - 0.5) * 10)          # never cut the moment right before the payoff
+    while i < stop:
+        if quiet[i]:
+            j = i
+            while j < stop and quiet[j]:
+                j += 1
+            if (j - i) * 0.1 >= min_gap:              # long enough to be boring: cut it (keep 0.15 s each side)
+                a, b = i * 0.1 + 0.15, j * 0.1 - 0.15
+                if a > cur:
+                    keep.append((cur, a))
+                cur = b
+            i = j
+        else:
+            i += 1
+    keep.append((cur, end))
+    keep = [(round(a, 2), round(b, 2)) for a, b in keep if b - a >= 0.3]
+    total = sum(b - a for a, b in keep)
+    return keep if total >= cfg.get("min_short_seconds", 6) else [(round(start, 2), round(end, 2))]
+
+
+def tighten_clip(src, clip, cfg):
+    """Jump-cut the clip so the payoff comes fast. Returns the new file (or the original)."""
+    if not cfg.get("jump_cuts", True):
+        return src
+    rms = rms_profile(src)
+    peak = find_peak(src)
+    if peak is None or len(rms) < 20:
+        return src                                    # no clear payoff: leave the clip alone
+    keep = plan_cuts(rms, peak, cfg)
+    dur = len(rms) * 0.1
+    if len(keep) == 1 and keep[0][0] < 0.3 and keep[0][1] > dur - 0.3:
+        return src                                    # nothing worth cutting
+    expr = "+".join(f"between(t,{a},{b})" for a, b in keep)
+    out = DOWNLOADS / f"{clip['id']}_cut.mp4"
+    cmd = [ffmpeg_path(), "-y", "-loglevel", "error", "-i", str(src),
+           "-vf", f"select='{expr}',setpts=N/FRAME_RATE/TB",
+           "-af", f"aselect='{expr}',asetpts=N/SR/TB",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-c:a", "aac", "-b:a", "192k", str(out)]
+    subprocess.run(cmd, check=True, timeout=600)
+    new_len = sum(b - a for a, b in keep)
+    log(f"  jump cuts: {dur:.0f}s -> {new_len:.0f}s ({len(keep)} pieces)")
+    return out
+
+
+# ---------------- Is this clip actually good? ----------------
+
+FUNNY_WORDS = ["haha", "hahaha", "lmao", "lol", "bro", "bruh", "nah", "why", "wtf", "yo",
+               "what", "dude", "stop", "help", "noo", "dead", "crying", "chat", "dawg"]
+HYPE_WORDS = ["let's go", "lets go", "no way", "oh my god", "omg", "clutch", "insane", "gg",
+              "we did it", "finally", "first try", "yes", "easy", "cracked", "goated", "let's gooo"]
+TITLE_FUNNY = ["lol", "lmao", "funny", "fail", "dies", "died", "crash", "💀", "😭", "bro", "why", "wtf", "rip"]
+TITLE_HYPE = ["insane", "clutch", "first try", "no way", "crazy", "best", "perfect", "world record", "god"]
+
+
+def score_moment(raw, clip, cfg):
+    """Free heuristic: how funny / hype is this clip? Returns (score, category)."""
+    import math
+    text = ""
+    try:
+        words = transcribe_words(raw, cfg.get("caption_timeout", 240))
+        text = " " + " ".join(w for w, _, _ in words).lower() + " "
+    except Exception as e:
+        log(f"  (scoring without speech: {e})")
+    funny = sum(text.count(f" {w}") for w in FUNNY_WORDS)
+    hype = sum(text.count(f" {w}") for w in HYPE_WORDS)
+    title = clip.get("title", "").lower()
+    funny += 2 * sum(k in title for k in TITLE_FUNNY)
+    hype += 2 * sum(k in title for k in TITLE_HYPE)
+
+    rms = rms_profile(raw)
+    excite = 0.0
+    if len(rms) >= 10:
+        mean = sum(rms) / len(rms) or 1
+        excite = max(0.0, max(rms) / mean - 1.5)              # big spike = yelling/screaming
+        excite += sum(1 for v in rms if v > mean * 2.2) / 10   # how long it stays loud
+
+    moment = 1.5 * min(funny, 8) + 1.5 * min(hype, 8) + 2 * min(excite, 4)
+    if funny == 0 and hype == 0 and excite < 0.5:
+        category = "boring"
+    elif hype > funny:
+        category = "achievement"
+    else:
+        category = "funny"
+    ladder = {0: 4, 1: 1.5}.get(clip.get("_tier", 2), 0)        # ranked + live streamers still get a head start
+    ladder += max(0, 2 - clip.get("_rank", 999) * 0.1)          # higher on your list = small bonus
+    score = moment + ladder + math.log10(max(clip["view_count"], 1))
+    return round(score, 1), category
+
+
 GENERIC_TITLES = {"", "lol", "lmao", "w", "l", "clip", "omg", "bruh", "wtf", "xd", "kek",
                   "pog", "poggers", "lul", "omegalul", "kekw", "haha", "wow", "nice", "gg"}
+
+ACHIEVEMENT_HOOKS = [
+    "{name} ACTUALLY DID IT",
+    "NO WAY HE PULLED THIS OFF",
+    "THIS WAS INSANE",
+    "{name} WENT CRAZY HERE",
+    "FIRST TRY?!",
+]
 
 HOOK_TEMPLATES = [
     "WAIT FOR IT...",
@@ -382,7 +541,8 @@ def pick_hook(clip):
         if len(hook) > 60:
             hook = hook[:57].rsplit(" ", 1)[0] + "..."
     else:
-        t = random.choice(HOOK_TEMPLATES)
+        pool = ACHIEVEMENT_HOOKS if clip.get("_category") == "achievement" else HOOK_TEMPLATES
+        t = random.choice(pool)
         hook = t.format(name=display.upper())
         text = t.format(name="{N}").lower()
         text = (text[0].upper() + text[1:]).replace("{n}", display)
@@ -394,7 +554,7 @@ def make_hook(clip):
     return pick_hook(clip)[0]
 
 
-def build_top_ass(clip, out_path):
+def build_top_ass(clip, out_path, split=False):
     """Streamer name (small) + hook line (big, wraps to 2 lines) in the top blurred area."""
     import re
     def esc(t):
@@ -414,9 +574,84 @@ def build_top_ass(clip, out_path):
     if name:
         lines.append(f"Dialogue: 0,0:00:00.00,9:59:59.00,Name,@{esc(name)}")
     pop = r"{\fscx70\fscy70\t(0,120,\fscx105\fscy105)\t(120,200,\fscx100\fscy100)}"
+    if split:   # sit the hook right on the line between face-cam and gameplay
+        pop = r"{\an5\pos(540,672)\fs92}" + pop
     lines.append(f"Dialogue: 0,0:00:00.00,9:59:59.00,Hook,{pop}{hook}")
     out_path.write_text(header + "\n".join(lines))
     return out_path
+
+
+def find_peaks(src, n=3, gap=3.0):
+    """Up to n loud moments (seconds), loudest first, at least `gap` apart."""
+    rms = rms_profile(src)
+    if len(rms) < 10:
+        return []
+    mean = sum(rms) / len(rms) or 1
+    order = sorted(range(len(rms)), key=lambda i: rms[i], reverse=True)
+    peaks = []
+    for i in order:
+        if rms[i] / mean < 1.8:
+            break
+        t = max(0.0, i * 0.1 - 0.05)
+        if all(abs(t - q) >= gap for q in peaks):
+            peaks.append(t)
+        if len(peaks) >= n:
+            break
+    return peaks
+
+
+def find_facecam(src):
+    """Find the streamer's webcam: a face that stays in the same spot across the clip.
+    Returns (x, y, w, h, W, H) crop box in source pixels, or None."""
+    try:
+        import cv2
+    except Exception:
+        return None
+    cap = cv2.VideoCapture(str(src))
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    W, H = cap.get(3), cap.get(4)
+    if n < 10 or not W or not H:
+        cap.release()
+        return None
+    casc = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    dets = []
+    for k in range(8):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(n * (k + 0.5) / 8))
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        small = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        faces = casc.detectMultiScale(gray, 1.1, 6, minSize=(28, 28))
+        dets.append([(x * 2, y * 2, w * 2, h * 2) for (x, y, w, h) in faces])
+    cap.release()
+    if not dets:
+        return None
+    best = None
+    for f in [f for fs in dets for f in fs]:
+        cx, cy = f[0] + f[2] / 2, f[1] + f[3] / 2
+        hits = []
+        for fs in dets:
+            m = [g for g in fs if abs(g[0] + g[2] / 2 - cx) < W * 0.05 and abs(g[1] + g[3] / 2 - cy) < H * 0.07]
+            if m:
+                hits.append(m[0])
+        if len(hits) >= max(3, int(0.6 * len(dets))) and (best is None or len(hits) > len(best)):
+            best = hits
+    if not best:
+        return None                                   # no steady face = no webcam (or face hidden)
+    med = lambda i: sorted(h[i] for h in best)[len(best) // 2]
+    fx, fy, fw, fh = med(0), med(1), med(2), med(3)
+    if fw < H * 0.05:
+        return None                                   # too tiny to look good blown up
+    cw = min(W, fw * 3.0)
+    ch = cw * 672 / 1080
+    if ch > H:
+        ch, cw = H, H * 1080 / 672
+    cx, cy = fx + fw / 2, fy + fh / 2 + fh * 0.25
+    x = min(max(0, cx - cw / 2), W - cw)
+    y = min(max(0, cy - ch / 2), H - ch)
+    ev = lambda v: int(v) // 2 * 2
+    return ev(x), ev(y), ev(cw), ev(ch), ev(W), ev(H)
 
 
 def make_vertical(src, clip, cfg):
@@ -424,18 +659,34 @@ def make_vertical(src, clip, cfg):
     import re
     out = SHORTS / f"{clip['id']}_short.mp4"
 
-    vf = (
-        "[0:v]scale=-2:1920,crop=1080:1920,boxblur=24:6,eq=brightness=-0.08[bg];"
-        "[0:v]scale=1080:-2[fg];"
-        "[bg][fg]overlay=(W-w)/2:(H-h)/2,fps=30[v1]"
-    )
+    cam = find_facecam(src) if cfg.get("layout", "split") == "split" else None
+    if cam:
+        # streamer's face on top, gameplay underneath (reaction + moment at the same time)
+        x, y, w, h, W, H = cam
+        gw = int(H * 1080 / 1248) // 2 * 2
+        gx = int((W - gw) / 2) // 2 * 2
+        vf = (
+            f"[0:v]split=2[fa][fb];"
+            f"[fa]crop={w}:{h}:{x}:{y},scale=1080:672,setsar=1[top];"
+            f"[fb]crop={gw}:{H}:{gx}:0,scale=1080:1248,setsar=1[bot];"
+            f"[top][bot]vstack=inputs=2,fps=30[v1]"
+        )
+        log("  layout: split screen (face-cam found)")
+    else:
+        vf = (
+            "[0:v]scale=-2:1920,crop=1080:1920,boxblur=24:6,eq=brightness=-0.08[bg];"
+            "[0:v]scale=1080:-2[fg];"
+            "[bg][fg]overlay=(W-w)/2:(H-h)/2,fps=30[v1]"
+        )
+    clip["_split"] = bool(cam)
     last_v = "[v1]"
 
-    peak = find_peak(src) if cfg.get("effects", True) else None
+    peaks = find_peaks(src, cfg.get("max_booms", 3)) if cfg.get("effects", True) else []
+    peak = peaks[0] if peaks else None
     if peak is not None:
         T = f"{peak:.2f}"
-        # punch-in zoom that eases back out + shake
-        z = f"if(between(it,{T},{T}+0.7),1+0.25*(1-(it-{T})/0.7),1)"
+        # punch-in zoom on every big moment (eases back out), shake on the biggest one
+        z = "1" + "".join(f"+if(between(it,{q:.2f},{q:.2f}+0.7),0.25*(1-(it-{q:.2f})/0.7),0)" for q in peaks)
         shake = f"if(between(it,{T},{T}+0.4),18*sin(it*95),0)"
         vf += (
             f";{last_v}zoompan=z='{z}':d=1:s=1080x1920:fps=30"
@@ -450,7 +701,7 @@ def make_vertical(src, clip, cfg):
         vf += f";{last_v}ass='{ass}':fontsdir='{FONTS}'[vcap]"
         last_v = "[vcap]"
 
-    top = build_top_ass(clip, SHORTS / f"{clip['id']}_top.ass")
+    top = build_top_ass(clip, SHORTS / f"{clip['id']}_top.ass", split=clip.get("_split", False))
     vf += f";{last_v}ass='{top}':fontsdir='{FONTS}'[vtop]"
     last_v = "[vtop]"
 
@@ -474,13 +725,13 @@ def make_vertical(src, clip, cfg):
         audio_parts.append("[m]")
         n_in += 1
 
-    if peak is not None:
-        ms = int(peak * 1000)
+    for k, q in enumerate(peaks):              # a bass "boom" on each big moment
+        ms = int(q * 1000)
         cmd += ["-f", "lavfi", "-i",
                 "aevalsrc='0.9*sin(2*PI*55*t)*exp(-5*t)+0.35*(random(0)*2-1)*exp(-18*t)'"
                 ":d=1:s=44100"]
-        vf += f";[{n_in}:a]adelay={ms}|{ms},volume=1.4[boom]"
-        audio_parts.append("[boom]")
+        vf += f";[{n_in}:a]adelay={ms}|{ms},volume=1.4[boom{k}]"
+        audio_parts.append(f"[boom{k}]")
         n_in += 1
 
     if len(audio_parts) > 1:
@@ -531,11 +782,20 @@ def youtube_service():
 
 TITLE_EMOJIS = ["💀", "😭", "🔥", "😂", "😳", "🤣", "😱", "", ""]   # "" = sometimes no emoji
 
-DESCRIPTION_STYLES = [
-    "{title}\n\nFull credit to {streamer}, catch the stream at {url}\n\n{tags}",
-    "{streamer} on stream 🎮\nWatch live: {url}\n\n{tags}",
-    "Clipped from {streamer}'s stream ({url}).\nFollow for more {game} moments every day.\n\n{tags}",
-    "{title}\n\nStreamer: {streamer} | {url}\nNew {game} clips daily.\n\n{tags}",
+KEYWORD_LINES = [
+    "{streamer} playing {game} on stream",
+    "{streamer} {game} funny moment",
+    "{streamer} live on Twitch, {game}",
+    "Best {game} moment from {streamer}'s stream",
+]
+
+COMMENT_HOOKS = [
+    "Would you have survived this? 😂",
+    "Rate this moment 1-10 👇",
+    "Tag a friend who plays like this 💀",
+    "What would you have done here? 👀",
+    "Who's the funniest {game} streamer so far? 👇",
+    "Funniest part? Comment the timestamp 😭",
 ]
 
 CREDIT_LINES = [
@@ -556,31 +816,66 @@ def game_labels(cfg):
     return name, "#" + short.lower() if short else "#gaming"
 
 
-def upload_short(yt, video_path, clip, cfg):
-    from googleapiclient.http import MediaFileUpload
+# how people actually type these names when searching (Twitch display names have no spaces)
+NICE_NAMES = {
+    "kaicenat": "Kai Cenat", "caseoh_": "CaseOh", "stableronaldo": "Stable Ronaldo",
+    "plaqueboymax": "Plaqueboymax", "yourragegaming": "YourRAGE", "agent00": "Agent 00",
+    "moistcr1tikal": "penguinz0", "loltyler1": "Tyler1", "hasanabi": "HasanAbi",
+}
 
-    streamer = clip["broadcaster_name"]
-    handle = re.sub(r"[^A-Za-z0-9_]", "", streamer).lower()
-    url = f"https://twitch.tv/{handle}" if handle else "https://twitch.tv"
+
+def post_text(clip, cfg):
+    """Shared pieces for YouTube + Instagram: title, keyword line, comment hook, tags."""
+    raw_name = clip["broadcaster_name"]
+    handle = re.sub(r"[^A-Za-z0-9_]", "", raw_name).lower()
+    names = {**NICE_NAMES, **{k.lower(): v for k, v in cfg.get("streamer_names", {}).items()}}
+    streamer = names.get(handle, raw_name)
     game, game_tag = game_labels(cfg)
-    _, title_text = pick_hook(clip)
-
+    _, text = pick_hook(clip)
+    if streamer != raw_name:      # "KaiCenat was..." -> "Kai Cenat was..."
+        text = re.sub(rf"\b{re.escape(raw_name.rstrip('_'))}_?\b", streamer, text, flags=re.IGNORECASE)
     emoji = random.choice(TITLE_EMOJIS)
-    title = f"{title_text} {emoji}".strip()
+
+    # searchable suffix: "| Kai Cenat GTA 6", without repeating what the hook already says
+    has_name = streamer.lower() in text.lower() or raw_name.lower() in text.lower()
+    has_game = "gta" in text.lower()
+    suffix = " ".join(x for x in ([] if has_name else [streamer]) + ([] if has_game else [game]))
+    title = f"{text} {emoji}".strip() + (f" | {suffix}" if suffix else "")
     if len(title) > 100:
         title = title[:97].rsplit(" ", 1)[0] + "..."
 
-    extra = random.sample(["#gta", "#shorts", "#gaming", "#twitch", "#funny"], 2)
-    tag_list = [game_tag] + ([f"#{handle}"] if handle else []) + extra   # 3-4 tags, game always correct
-    description = random.choice(DESCRIPTION_STYLES).format(
-        title=title_text, streamer=streamer, url=url, game=game, tags=" ".join(tag_list)
-    ) + "\n\n" + random.choice(CREDIT_LINES)
+    return {
+        "streamer": streamer, "handle": handle, "game": game, "game_tag": game_tag,
+        "title": title, "text": text, "emoji": emoji,
+        "keyword": random.choice(KEYWORD_LINES).format(streamer=streamer, game=game),
+        "comment": random.choice(COMMENT_HOOKS).format(game=game),
+        "url": f"https://twitch.tv/{handle}" if handle else "https://twitch.tv",
+        "clips_tag": game_tag + "clips",            # e.g. #gta6clips
+    }
+
+
+def upload_short(yt, video_path, clip, cfg):
+    from googleapiclient.http import MediaFileUpload
+
+    t = post_text(clip, cfg)
+    # first 3 hashtags show above the title on YouTube, so most important first
+    tags = [t["game_tag"]] + ([f"#{t['handle']}"] if t["handle"] else []) + [t["clips_tag"], "#shorts"]
+    tags.append(random.choice(["#gaming", "#twitch", "#funnymoments", "#gta"]))
+    description = (
+        f"{t['keyword']}\n{t['comment']}\n\n"
+        f"🎥 Streamer: {t['streamer']} | {t['url']}\n"
+        f"New {t['game']} clips every day.\n\n"
+        f"{' '.join(tags)}\n\n{random.choice(CREDIT_LINES)}"
+    )
+    g, st = t["game"].lower(), t["streamer"].lower()
+    search_tags = [f"{st} {g}", f"{g} funny moments", f"{g} clips", f"{g} gameplay",
+                   g, st, "twitch clips", "gta funny moments"]
 
     body = {
         "snippet": {
-            "title": title,
+            "title": t["title"],
             "description": description,
-            "tags": [game.lower(), game_tag[1:], "grand theft auto", streamer, "twitch clips", "shorts"],
+            "tags": search_tags,
             "categoryId": "20",
         },
         "status": {
@@ -647,15 +942,17 @@ def post_reel(video_path, caption):
 
 
 def reel_caption(clip, cfg):
-    streamer = clip["broadcaster_name"]
-    handle = re.sub(r"[^A-Za-z0-9_]", "", streamer).lower()
-    game, game_tag = game_labels(cfg)
-    _, title_text = pick_hook(clip)
-    emoji = random.choice(TITLE_EMOJIS)
-    tags = " ".join([game_tag, "#gta", f"#{handle}" if handle else "#twitch", "#gaming", "#reels"])
-    return (f"{title_text} {emoji}".strip()
-            + f"\n\n🎥 {streamer} on Twitch (twitch.tv/{handle})\nFollow for daily {game} clips\n\n{tags}"
-            + "\n\nAll credit to the streamer. DM for removal.")
+    t = post_text(clip, cfg)
+    me = cfg.get("channel_handle", "@clipnidia")
+    tags = " ".join([t["game_tag"], t["clips_tag"]] + ([f"#{t['handle']}"] if t["handle"] else []) + ["#gaming", "#reels"])
+    return (
+        f"{t['text']} {t['emoji']}".strip() + "\n"
+        f"{t['keyword']} 🎮\n\n"
+        f"{t['comment']}\n"
+        f"Follow {me} for daily {t['game']} clips\n\n"
+        f"🎥 twitch.tv/{t['handle']}\n"
+        f"All credit to the streamer. DM for removal.\n\n{tags}"
+    )
 
 
 # ---------------- Main ----------------
@@ -679,9 +976,51 @@ def main():
     if len(new_clips) < len(clips):
         log(f"  skipping {len(clips) - len(new_clips)} already posted")
     max_uploads = cfg.get("max_uploads_per_run", 2)
-    picked = new_clips[:max_uploads]
-    if not picked:
+    per_streamer = cfg.get("max_per_streamer", 1)
+
+    # 1) shortlist from the top of the hierarchy (a couple per streamer so we can choose their best)
+    shortlist, count = [], {}
+    for c in new_clips:
+        bid = c.get("broadcaster_id")
+        if count.get(bid, 0) >= 2:
+            continue
+        shortlist.append(c)
+        count[bid] = count.get(bid, 0) + 1
+        if len(shortlist) >= cfg.get("candidates_per_run", 4):
+            break
+    if not shortlist:
         log("nothing new to post")
+        return
+
+    # 2) score each one: funny / achievement / boring
+    scored = []
+    for c in shortlist:
+        try:
+            raw = download_clip(c)
+            c["_score"], c["_category"] = score_moment(raw, c, cfg)
+            log(f"  score {c['_score']:>5} [{c['_category']}] {c['broadcaster_name']} - {c['title'][:50]}")
+            scored.append(c)
+        except Exception as e:
+            log(f"  skip {c['id']}: {e}")
+
+    # 3) best moments first; boring ones only if nothing else
+    scored.sort(key=lambda c: (c["_category"] == "boring", -c["_score"]))
+    picked, used = [], {}
+    for c in scored:
+        bid = c.get("broadcaster_id")
+        if used.get(bid, 0) >= per_streamer:
+            continue
+        if c["_category"] == "boring" and not cfg.get("allow_boring", False) and picked:
+            continue
+        picked.append(c)
+        used[bid] = used.get(bid, 0) + 1
+        if len(picked) >= max_uploads:
+            break
+    for c in scored:                               # delete downloads we didn't pick
+        if c not in picked:
+            (DOWNLOADS / f"{c['id']}.mp4").unlink(missing_ok=True)
+    if not picked:
+        log("nothing worth posting this run")
         return
 
     yt = None if args.dry_run else youtube_service()
@@ -690,7 +1029,8 @@ def main():
         try:
             log(f"processing: {clip['broadcaster_name']} — {clip['title']} ({clip['view_count']} views)")
             raw = download_clip(clip)
-            short = make_vertical(raw, clip, cfg)
+            tight = tighten_clip(raw, clip, cfg)
+            short = make_vertical(tight, clip, cfg)
             if args.dry_run:
                 log(f"dry run — short built at {short}")
             else:
@@ -707,6 +1047,8 @@ def main():
                 history["posted_clip_ids"].append(clip["id"])
                 save_history(history)
             raw.unlink(missing_ok=True)  # keep disk clean, keep the short
+            if tight != raw:
+                Path(tight).unlink(missing_ok=True)
         except Exception as e:
             log(f"ERROR on clip {clip['id']}: {e}")
 
