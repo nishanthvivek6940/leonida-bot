@@ -401,6 +401,41 @@ def rms_profile(src, win_s=0.1):
     return out
 
 
+def motion_profile(src, crop=None):
+    """How much the picture changes every 0.1 s (0 = frozen). crop=(x, y, w, h) to only watch
+    one area, e.g. the streamer's face-cam (big jump = big physical reaction)."""
+    try:
+        import numpy as np
+        vf = "fps=10"
+        if crop:
+            x, y, w, h = crop
+            vf += f",crop={w}:{h}:{x}:{y}"
+        vf += ",scale=96:54,format=gray"
+        r = subprocess.run([ffmpeg_path(), "-v", "error", "-i", str(src), "-vf", vf,
+                            "-f", "rawvideo", "-"], capture_output=True, timeout=180)
+        frames = np.frombuffer(r.stdout, np.uint8)
+        n = len(frames) // (96 * 54)
+        if n < 3:
+            return []
+        frames = frames[: n * 96 * 54].reshape(n, 54, 96).astype(np.float32)
+        diff = np.abs(np.diff(frames, axis=0)).mean(axis=(1, 2))
+        return [0.0] + [float(v) for v in diff]
+    except Exception:
+        return []
+
+
+def spike(values, around=None, window=15):
+    """How much the biggest jump stands out from normal (1 = no spike). Optionally only
+    look within `window` steps of index `around` (e.g. near the loud moment)."""
+    if len(values) < 5:
+        return 1.0
+    mean = sum(values) / len(values) or 1e-6
+    vals = values
+    if around is not None:
+        vals = values[max(0, around - window): around + window] or values
+    return max(vals) / mean
+
+
 def find_peak(src):
     """Time (s) of the loudest moment, or None if the clip has no clear spike."""
     rms = rms_profile(src)
@@ -433,8 +468,9 @@ def snap_to_speech(start, end, words, dur, cfg):
     return round(start, 2), round(end, 2)
 
 
-def plan_cuts(rms, peak, cfg, words=None):
-    """Which parts of the clip to keep: short build-up, the payoff, the reaction; no dead air."""
+def plan_cuts(rms, peak, cfg, words=None, motion=None):
+    """Which parts of the clip to keep: short build-up, the payoff, the reaction; no boring bits.
+    Boring = dead quiet, OR fairly quiet while nothing much moves on screen. Speech is never cut."""
     dur = len(rms) * 0.1
     pre = cfg.get("max_buildup_seconds", 10)
     post = cfg.get("after_payoff_seconds", 5)
@@ -444,6 +480,12 @@ def plan_cuts(rms, peak, cfg, words=None):
     # dead air = quiet stretches before the payoff (quiet = under 35% of the clip's average loudness)
     mean = sum(rms) / len(rms)
     quiet = [v < mean * 0.35 for v in rms]
+    if motion and len(motion) > 5:
+        mmean = sum(motion) / len(motion) or 1e-6
+        for k in range(len(quiet)):
+            mv = motion[k] if k < len(motion) else mmean
+            if rms[k] < mean * 0.6 and mv < mmean * 0.45:   # quiet-ish AND nothing happening
+                quiet[k] = True
     for w, a, b in words or []:                       # speech is never dead air
         for k in range(max(0, int(a * 10)), min(len(quiet), int(b * 10) + 1)):
             quiet[k] = False
@@ -471,7 +513,8 @@ def plan_cuts(rms, peak, cfg, words=None):
 
 
 def tighten_clip(src, clip, cfg):
-    """Jump-cut the clip so the payoff comes fast. Returns the new file (or the original)."""
+    """Story cut: setup -> (skip boring) -> it happens -> (skip) -> payoff -> reaction.
+    Optionally opens with a 1-second teaser of the payoff so people stay to see how it happened."""
     if not cfg.get("jump_cuts", True):
         return src
     rms = rms_profile(src)
@@ -482,19 +525,33 @@ def tighten_clip(src, clip, cfg):
         words = transcribe_words(src, cfg.get("caption_timeout", 240))
     except Exception:
         words = []
-    keep = plan_cuts(rms, peak, cfg, words)
+    motion = motion_profile(src)
+    keep = plan_cuts(rms, peak, cfg, words, motion)
     dur = len(rms) * 0.1
-    if len(keep) == 1 and keep[0][0] < 0.3 and keep[0][1] > dur - 0.3:
+
+    # teaser: flash the payoff first ("how did we get here"), only if the payoff is far enough in
+    teaser = None
+    kept_before_peak = sum(min(b, peak) - a for a, b in keep if a < peak)
+    if cfg.get("teaser", True) and kept_before_peak >= cfg.get("teaser_min_buildup", 4):
+        t0 = max(0.0, peak - 0.25)
+        teaser = (round(t0, 2), round(min(dur, t0 + cfg.get("teaser_seconds", 1.2)), 2))
+
+    if not teaser and len(keep) == 1 and keep[0][0] < 0.3 and keep[0][1] > dur - 0.3:
         return src                                    # nothing worth cutting
-    expr = "+".join(f"between(t,{a},{b})" for a, b in keep)
+    pieces = ([teaser] if teaser else []) + keep
+    parts, labels = [], []
+    for k, (a, b) in enumerate(pieces):
+        parts.append(f"[0:v]trim={a}:{b},setpts=PTS-STARTPTS[v{k}];"
+                     f"[0:a]atrim={a}:{b},asetpts=PTS-STARTPTS[a{k}]")
+        labels.append(f"[v{k}][a{k}]")
+    fc = ";".join(parts) + ";" + "".join(labels) + f"concat=n={len(pieces)}:v=1:a=1[v][a]"
     out = DOWNLOADS / f"{clip['id']}_cut.mp4"
-    cmd = [ffmpeg_path(), "-y", "-loglevel", "error", "-i", str(src),
-           "-vf", f"select='{expr}',setpts=N/FRAME_RATE/TB",
-           "-af", f"aselect='{expr}',asetpts=N/SR/TB",
+    cmd = [ffmpeg_path(), "-y", "-loglevel", "error", "-i", str(src), "-filter_complex", fc,
+           "-map", "[v]", "-map", "[a]",
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-c:a", "aac", "-b:a", "192k", str(out)]
     subprocess.run(cmd, check=True, timeout=600)
-    new_len = sum(b - a for a, b in keep)
-    log(f"  jump cuts: {dur:.0f}s -> {new_len:.0f}s ({len(keep)} pieces)")
+    new_len = sum(b - a for a, b in pieces)
+    log(f"  story cut: {dur:.0f}s -> {new_len:.0f}s ({len(keep)} pieces{', teaser opening' if teaser else ''})")
     return out
 
 
@@ -611,48 +668,106 @@ def censor_clip(src, clip, cfg):
 # ---------------- Is this clip actually good? ----------------
 
 FUNNY_WORDS = ["haha", "hahaha", "lmao", "lol", "bro", "bruh", "nah", "why", "wtf", "yo",
-               "what", "dude", "stop", "help", "noo", "dead", "crying", "chat", "dawg"]
+               "what", "dude", "stop", "help", "noo", "dead", "crying", "chat", "dawg", "bro what",
+               "what the", "are you serious", "i can't", "this game", "who did", "huh"]
+FAIL_WORDS = ["wasted", "busted", "died", "dead", "crash", "crashed", "arrested", "cops", "police",
+              "oh no", "no no", "noo", "i'm done", "it's over", "why would", "not again", "run"]
 HYPE_WORDS = ["let's go", "lets go", "no way", "oh my god", "omg", "clutch", "insane", "gg",
               "we did it", "finally", "first try", "yes", "easy", "cracked", "goated", "let's gooo"]
-TITLE_FUNNY = ["lol", "lmao", "funny", "fail", "dies", "died", "crash", "💀", "😭", "bro", "why", "wtf", "rip"]
+TITLE_FUNNY = ["lol", "lmao", "funny", "fail", "dies", "died", "crash", "💀", "😭", "bro", "why", "wtf", "rip",
+               "arrested", "busted", "wasted", "cops", "glitch", "troll", "betray"]
 TITLE_HYPE = ["insane", "clutch", "first try", "no way", "crazy", "best", "perfect", "world record", "god"]
 
 
+def best_quote(words, peak):
+    """The streamer's own punchline: a short line said right around the big moment.
+    e.g. 'BRO WHAT IS THIS GAME'. Returns '' if nothing quotable."""
+    if not words or peak is None:
+        return ""
+    lines, cur = [], []
+    for i, (w, a, b) in enumerate(words):
+        if cur and a - cur[-1][2] > 0.6:             # pause = new line
+            lines.append(cur)
+            cur = []
+        cur.append((w, a, b))
+    if cur:
+        lines.append(cur)
+    best, best_score = "", 0.0
+    for ln in lines:
+        text = " ".join(w for w, _, _ in ln).strip(" .,!?")
+        n = len(text.split())
+        if not 2 <= n <= 8:
+            continue
+        start, end = ln[0][1], ln[-1][2]
+        near = 1.0 / (1.0 + abs((start + end) / 2 - peak))     # closer to the payoff = better
+        low = " " + text.lower() + " "
+        punch = sum(low.count(f" {k}") for k in FUNNY_WORDS + FAIL_WORDS + HYPE_WORDS)
+        sc = near * 3 + punch + (1 if 3 <= n <= 6 else 0)
+        if sc > best_score:
+            best, best_score = text, sc
+    return clean_word(best) if best_score >= 1.5 else ""
+
+
 def score_moment(raw, clip, cfg):
-    """Free heuristic: how funny / hype is this clip? Returns (score, category)."""
+    """Free heuristic for the 7 things that make a clip funny. Returns (score, category)."""
     import math
-    text = ""
+    text, words, heard = "", [], False
     try:
         words = transcribe_words(raw, cfg.get("caption_timeout", 240))
         text = " " + " ".join(w for w, _, _ in words).lower() + " "
+        heard = True
     except Exception as e:
         log(f"  (scoring without speech: {e})")
-    funny = sum(text.count(f" {w}") for w in FUNNY_WORDS)
-    hype = sum(text.count(f" {w}") for w in HYPE_WORDS)
     title = clip.get("title", "").lower()
-    funny += 2 * sum(k in title for k in TITLE_FUNNY)
-    hype += 2 * sum(k in title for k in TITLE_HYPE)
+    funny = sum(text.count(f" {w}") for w in FUNNY_WORDS) + 2 * sum(k in title for k in TITLE_FUNNY)
+    fail = sum(text.count(f" {w}") for w in FAIL_WORDS)                       # 3. fails / karma
+    hype = sum(text.count(f" {w}") for w in HYPE_WORDS) + 2 * sum(k in title for k in TITLE_HYPE)
 
     rms = rms_profile(raw)
-    excite = 0.0
+    excite, peak_i = 0.0, None
     if len(rms) >= 10:
         mean = sum(rms) / len(rms) or 1
-        excite = max(0.0, max(rms) / mean - 1.5)              # big spike = yelling/screaming
+        peak_i = max(range(len(rms)), key=lambda i: rms[i])
+        excite = max(0.0, max(rms) / mean - 1.5)              # 1. yelling / screaming
         excite += sum(1 for v in rms if v > mean * 2.2) / 10   # how long it stays loud
 
-    moment = 1.5 * min(funny, 8) + 1.5 * min(hype, 8) + 2 * min(excite, 4)
-    if funny == 0 and hype == 0 and excite < 0.5:
+    # 1. big physical reaction: the face-cam suddenly moves a lot near the loud moment
+    clip["_cam"] = find_facecam(raw) if cfg.get("layout", "split") == "split" else None
+    reaction = 0.0
+    if clip["_cam"]:
+        x, y, w, h, _, _ = clip["_cam"]
+        cam_motion = motion_profile(raw, (x, y, w, h))
+        reaction = max(0.0, spike(cam_motion, peak_i) - 2.0)
+    # 2. something unexpected: the game picture suddenly changes a lot (crash, explosion, chaos)
+    chaos = max(0.0, spike(motion_profile(raw), peak_i) - 2.5)
+    # 4. chaos with friends: lots of talking packed into the clip
+    dur = len(rms) * 0.1 or 1
+    density = len(words) / dur                             # words per second
+    group = max(0.0, density - 2.5)
+    # 5. a quotable one-liner near the payoff
+    clip["_quote"] = best_quote(words, peak_i * 0.1 if peak_i is not None else None)
+    quote = 3.0 if clip["_quote"] else 0.0
+    # the streamer's voice is half the joke: silent clips lose, talking / yelling clips win
+    talk_secs = sum(b - a for _, a, b in words)
+    if heard and (len(words) < cfg.get("min_words", 5) or talk_secs < 2.0):
+        talking = -cfg.get("silent_penalty", 8)          # barely says anything
+    else:
+        talking = min(len(words) / 10, 2.0) + (1.5 if excite >= 1.5 and words else 0)
+
+    moment = (1.5 * min(funny, 8) + 2.0 * min(fail, 5) + 1.5 * min(hype, 8) + 2 * min(excite, 4)
+              + 1.5 * min(reaction, 4) + 1.0 * min(chaos, 4) + 1.0 * min(group, 3) + quote + talking)
+    if (funny == 0 and hype == 0 and fail == 0 and excite < 0.5 and reaction < 0.5) or (heard and talking < 0 and reaction < 1):
         category = "boring"
-    elif hype > funny:
+    elif hype > funny + fail:
         category = "achievement"
     else:
         category = "funny"
-    ladder = {0: 4, 1: 1.5}.get(clip.get("_tier", 2), 0)        # ranked + live streamers still get a head start
-    ladder += max(0, 2 - clip.get("_rank", 999) * 0.1)          # higher on your list = small bonus
-    # clips with the streamer's face-cam make much better shorts (split screen + their reaction)
-    clip["_cam"] = find_facecam(raw) if cfg.get("layout", "split") == "split" else None
+    ladder = {0: 4, 1: 1.5}.get(clip.get("_tier", 2), 0)        # 6. ranked + live streamers get a head start
+    ladder += max(0, 2 - clip.get("_rank", 999) * 0.1)
     cam_bonus = cfg.get("facecam_bonus", 4) if clip["_cam"] else 0
     score = moment + ladder + cam_bonus + math.log10(max(clip["view_count"], 1))
+    clip["_why"] = (f"talk {talking:+.1f} ({len(words)} words), react {reaction:.1f}, chaos {chaos:.1f}, fail {fail}, funny {funny}, "
+                    f"hype {hype}, loud {excite:.1f}" + (f', quote "{clip["_quote"]}"' if clip["_quote"] else ""))
     return round(score, 1), category
 
 
@@ -697,6 +812,10 @@ def pick_hook(clip):
         hook = title.upper()
         if len(hook) > 60:
             hook = hook[:57].rsplit(" ", 1)[0] + "..."
+    elif clip.get("_quote"):                                   # streamer's own punchline
+        q = clip["_quote"]
+        hook = f'"{q.upper()}"'
+        text = f'{display}: "{q[0].upper() + q[1:]}"'
     else:
         pool = ACHIEVEMENT_HOOKS if clip.get("_category") == "achievement" else HOOK_TEMPLATES
         t = random.choice(pool)
@@ -834,7 +953,10 @@ def make_vertical(src, clip, cfg):
     import re
     out = SHORTS / f"{clip['id']}_short.mp4"
 
-    cam = find_facecam(src) if cfg.get("layout", "split") == "split" else None
+    if "_cam" in clip:                                   # already found while scoring
+        cam = clip["_cam"]
+    else:
+        cam = find_facecam(src) if cfg.get("layout", "split") == "split" else None
     if cam:
         # streamer's face on top, gameplay underneath (reaction + moment at the same time)
         x, y, w, h, W, H = cam
@@ -885,7 +1007,7 @@ def make_vertical(src, clip, cfg):
     audio_parts = ["[0:a]"]
     n_in = 1
 
-    music = pick_music(src)
+    music = pick_music(src) if cfg.get("music", False) else None   # off by default: the streamer's voice is the content
     if music:
         vol = cfg.get("music_volume", 0.10)
         dur = track_duration(music) or 0
@@ -1186,6 +1308,7 @@ def main():
             c["_score"], c["_category"] = score_moment(raw, c, cfg)
             cam = "cam" if c.get("_cam") else "no cam"
             log(f"  score {c['_score']:>5} [{c['_category']}, {cam}] {c['broadcaster_name']} - {c['title'][:50]}")
+            log(f"        ({c.get('_why', '')})")
             scored.append(c)
         except Exception as e:
             log(f"  skip {c['id']}: {e}")
