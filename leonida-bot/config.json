@@ -5,7 +5,7 @@
   "game_name": "Grand Theft Auto VI",
   "streamers": ["kaicenat", "ishowspeed", "caseoh_", "zackrawrr", "hasanabi", "plaqueboymax", "duke", "jynxzi", "xqc", "rayasianboy", "thetylilshow", "stableronaldo", "yourragegaming", "lacy", "agent00", "jasontheween", "emiru", "mizkif", "lirik", "timthetatman", "summit1g"],
 "max_per_streamer": 1,
-
+"min_short_seconds": 12,
   "lookback_hours": 24,
   "min_views": 1000,
   "max_uploads_per_run": 2,
