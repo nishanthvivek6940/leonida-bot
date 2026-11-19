@@ -1138,6 +1138,46 @@ def find_facecam(src):
         return None
 
 
+def webcam_box(smalls, face, W, H):
+    """Find the webcam's real rectangle: inside it the room barely changes, while the game around it
+    keeps changing. Frames are 1/4 size. Returns (x, y, w, h) in full pixels, or None."""
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return None
+    if len(smalls) < 6:
+        return None
+    sd = np.stack([f.astype(np.float32) for f in smalls]).std(0)
+    thr = max(8.0, 0.45 * float(np.median(sd)))
+    static = (sd < thr).astype(np.uint8)
+    fx, fy, fw, fh = [v / 4 for v in face]
+    k = max(3, int(fw * 1.2)) | 1                      # fill the hole where the streamer moves
+    closed = cv2.morphologyEx(static, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(closed)
+    cx, cy = int(fx + fw / 2), int(fy + fh / 2)
+    best = None
+    for i in range(1, n):
+        x, y, w, h, area = st[i]
+        if x <= cx <= x + w and y <= cy <= y + h:
+            if best is None or area < st[best][4]:
+                best = i
+    if best is None:
+        return None
+    x, y, w, h, area = st[best]
+    sh, sw = static.shape
+    face_area = fw * fh
+    if not (2.5 * face_area <= w * h <= 45 * face_area):   # way too small/big to be a webcam box
+        return None
+    if w > sw * 0.6 or h > sh * 0.75 or area / (w * h) < 0.6:  # not a solid rectangle
+        return None
+    if w / max(h, 1) < 0.8 or w / max(h, 1) > 2.6:
+        return None
+    pad = 0.02                                         # step in a little so the frame's border line is gone
+    x, y, w, h = x + w * pad, y + h * pad, w * (1 - 2 * pad), h * (1 - 2 * pad)
+    return x * 4, y * 4, w * 4, h * 4
+
+
 def _find_facecam(src):
     """Find the streamer's webcam: a face that keeps showing up in the same spot, near the
     edges of the screen (game characters move around and sit in the middle; webcams don't).
@@ -1153,13 +1193,14 @@ def _find_facecam(src):
     side = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
     min_face = int(H * 0.035)
     samples = 12
-    dets = []
+    dets, smalls = [], []
     for k in range(samples):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(n * (k + 0.5) / samples))
         ok, frame = cap.read()
         if not ok:
             continue
         gray = cv2.equalizeHist(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        smalls.append(cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (0, 0), fx=0.25, fy=0.25))
         found = list(front.detectMultiScale(gray, 1.08, 4, minSize=(min_face, min_face)))
         found += list(side.detectMultiScale(gray, 1.08, 4, minSize=(min_face, min_face)))
         flipped = side.detectMultiScale(cv2.flip(gray, 1), 1.08, 4, minSize=(min_face, min_face))
@@ -1188,14 +1229,27 @@ def _find_facecam(src):
         return None                                   # no steady face = no webcam (or face hidden)
     med = lambda i: sorted(h[i] for h in best)[len(best) // 2]
     fx, fy, fw, fh = med(0), med(1), med(2), med(3)
-    # crop around the face: small faces usually sit in a small cam box, so grab more around them
-    cw = min(W, max(fw * 3.0, min(W * 0.22, fw * 8.0)))
-    ch = cw * 672 / 1080
-    if ch > H:
-        ch, cw = H, H * 1080 / 672
-    cx, cy = fx + fw / 2, fy + fh / 2 + fh * 0.3
-    x = min(max(0, cx - cw / 2), W - cw)
-    y = min(max(0, cy - ch / 2), H - ch)
+    box = webcam_box(smalls, (fx, fy, fw, fh), W, H)
+    if box:                                            # crop exactly the webcam rectangle (no game bits)
+        bx, by, bw, bh = box
+        want = 1080 / 672
+        if bw / bh > want:                             # too wide: trim the sides, keep the face centred
+            cw, ch = bh * want, bh
+            x = min(max(bx, fx + fw / 2 - cw / 2), bx + bw - cw)
+            y = by
+        else:                                          # too tall: trim top/bottom around the face
+            cw, ch = bw, bw / want
+            x = bx
+            y = min(max(by, fy + fh / 2 + fh * 0.3 - ch / 2), by + bh - ch)
+    else:
+        # no clear webcam rectangle (cut-out cam): crop around the face
+        cw = min(W, max(fw * 3.0, min(W * 0.22, fw * 8.0)))
+        ch = cw * 672 / 1080
+        if ch > H:
+            ch, cw = H, H * 1080 / 672
+        cx, cy = fx + fw / 2, fy + fh / 2 + fh * 0.3
+        x = min(max(0, cx - cw / 2), W - cw)
+        y = min(max(0, cy - ch / 2), H - ch)
     ev = lambda v: int(v) // 2 * 2
     box = (ev(x), ev(y), ev(cw), ev(ch))
     # real webcam = a room that barely moves; a game scene keeps moving / cutting between shots
