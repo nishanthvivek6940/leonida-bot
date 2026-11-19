@@ -678,6 +678,7 @@ def make_vertical(src, clip, cfg):
             "[0:v]scale=1080:-2[fg];"
             "[bg][fg]overlay=(W-w)/2:(H-h)/2,fps=30[v1]"
         )
+        log("  layout: blur (no face-cam found)")
     clip["_split"] = bool(cam)
     last_v = "[v1]"
 
