@@ -217,12 +217,33 @@ def ffmpeg_path():
     return p
 
 
-def download_clip(clip):
+def download_clip(clip, cfg=None):
+    """Download the clip. If the stream recording (VOD) exists, grab the clip PLUS extra seconds
+    after it, so a reaction that kept going past where the clipper stopped isn't lost."""
+    cfg = cfg or {}
     out = DOWNLOADS / f"{clip['id']}.mp4"
     if out.exists():
         return out
+    extra, before = cfg.get("extend_after_seconds", 20), cfg.get("extend_before_seconds", 2)
+    off, vid = clip.get("vod_offset"), clip.get("video_id")
+    if extra and vid and off is not None:
+        a = max(0, int(off) - before)
+        b = int(off) + int(round(clip.get("duration", 30))) + extra
+        cmd = [sys.executable, "-m", "yt_dlp", "-q", "--no-warnings", "-f", "best[height<=1080]/best",
+               "--download-sections", f"*{a}-{b}", "-o", str(out), f"https://www.twitch.tv/videos/{vid}"]
+        try:
+            subprocess.run(cmd, check=True, timeout=420)
+            if out.exists() and out.stat().st_size > 200_000:
+                start = off - a                                   # where the original clip starts in our file
+                clip["_window"] = (start, start + clip.get("duration", 30))
+                log(f"  got clip + {extra}s after it from the stream recording")
+                return out
+        except Exception as e:
+            log(f"  (couldn't use the stream recording: {str(e)[:80]}; using the plain clip)")
+        out.unlink(missing_ok=True)
     cmd = [sys.executable, "-m", "yt_dlp", "-q", "--no-warnings", "-o", str(out), clip["url"]]
     subprocess.run(cmd, check=True, timeout=300)
+    clip.pop("_window", None)
     return out
 
 
@@ -381,20 +402,86 @@ def build_ass(words, out_path):
     return out_path
 
 
-def streamer_words_only(words, src, clip, cfg):
+def game_subtitle_profile(src):
+    """For every 0.1 s: is the GAME showing its own subtitle (white text, bottom middle)?
+    GTA prints subtitles whenever a character talks, so that's game dialogue, not the streamer."""
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return []
+    cap = cv2.VideoCapture(str(src))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    W, H = int(cap.get(3)), int(cap.get(4))
+    if not W or not H:
+        return []
+    step = max(1, int(round(fps / 5)))                   # look 5 times a second
+    y0, y1, x0, x1 = int(H * 0.86), int(H * 0.97), int(W * 0.2), int(W * 0.8)
+    scale = 1080 / H
+    out, i, last = [], 0, False
+    while True:
+        ok = cap.grab()
+        if not ok:
+            break
+        if i % step == 0:
+            ok, f = cap.retrieve()
+            if not ok:
+                break
+            band = cv2.cvtColor(f[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+            if scale != 1:
+                band = cv2.resize(band, (0, 0), fx=scale, fy=scale)
+            n, _, st, _ = cv2.connectedComponentsWithStats((band > 190).astype(np.uint8))
+            ys = [sy + sh / 2 for sx, sy, sw, sh, sa in st[1:] if 3 <= sh <= 30 and sw <= 40 and sa >= 4]
+            if len(ys) >= 6:                              # letters sitting on one line = a subtitle
+                mid = sorted(ys)[len(ys) // 2]
+                last = sum(1 for y in ys if abs(y - mid) <= 14) >= 6
+            else:
+                last = False
+        t = i / fps
+        while len(out) < int(t * 10) + 1:
+            out.append(last)
+        i += 1
+    cap.release()
+    return out
+
+
+def streamer_words_only(words, src, clip, cfg, quiet=False):
     """Drop lines spoken by the game (cutscenes, NPCs). Trick: when the streamer talks, their
     face on the cam moves; when a game character talks, the streamer is usually just watching."""
+    if not words or not cfg.get("skip_game_captions", True):
+        return words
+    subs = game_subtitle_profile(src)
     cam = clip.get("_cam")
-    if not cam or not words or not cfg.get("skip_game_captions", True):
-        return words
-    x, y, w, h, _, _ = cam
-    motion = motion_profile(src, (x, y, w, h))
-    if len(motion) < 10:
-        return words
-    base = sorted(motion)[len(motion) // 2] or 1e-6          # typical face movement in this clip
-    factor = cfg.get("game_voice_factor", 0.6)
+    if not cam:                                        # no face-cam: game subtitles are our only clue
+        is_game = lambda avg: False
+        motion, base = [], 1
+        return _drop_game_lines(words, subs, motion, is_game, quiet)
+    face = clip.get("_face")
+    if face:                                           # watch the MOUTH: talking moves it, watching doesn't
+        fx, fy, fw, fh = face
+        region = (int(fx + fw * 0.2) // 2 * 2, int(fy + fh * 0.55) // 2 * 2,
+                  max(8, int(fw * 0.6) // 2 * 2), max(8, int(fh * 0.45) // 2 * 2))
+        motion = motion_profile(src, region)
+        if len(motion) < 10:
+            return words
+        base = sorted(motion)[len(motion) // 4] or 1e-6       # mouth at rest
+        factor = cfg.get("mouth_talk_factor", 1.2)            # careful: head/hand moves fool this
+        is_game = lambda avg: avg < base * factor
+    else:
+        x, y, w, h, _, _ = cam
+        motion = motion_profile(src, (x, y, w, h))
+        if len(motion) < 10:
+            return words
+        base = sorted(motion)[len(motion) // 2] or 1e-6       # typical face movement in this clip
+        factor = cfg.get("game_voice_factor", 0.6)
+        is_game = lambda avg: avg < base * factor
+    return _drop_game_lines(words, subs, motion, is_game, quiet)
+
+
+def _drop_game_lines(words, subs, motion, is_game, quiet):
+    """Split words into lines (pauses) and drop the ones the game said."""
     lines, cur = [], []
-    for wd in words:                                        # group into lines (pause = new line)
+    for wd in words:
         if cur and wd[1] - cur[-1][2] > 0.6:
             lines.append(cur)
             cur = []
@@ -404,12 +491,16 @@ def streamer_words_only(words, src, clip, cfg):
     keep, dropped = [], 0
     for ln in lines:
         a, b = int(ln[0][1] * 10), int(ln[-1][2] * 10) + 1
-        seg = motion[a:b] or [base]
-        if sum(seg) / len(seg) < base * factor:             # face basically still = game talking
+        sub = subs[a:b]
+        if sub and sum(sub) / len(sub) >= 0.4:          # game subtitle on screen = a character said it
+            dropped += 1
+            continue
+        seg = motion[a:b]
+        if seg and is_game(sum(seg) / len(seg)):         # streamer's mouth/face still = not them
             dropped += 1
             continue
         keep += ln
-    if dropped:
+    if dropped and not quiet:
         log(f"  captions: skipped {dropped} game-voice line(s)")
     return keep
 
@@ -485,13 +576,21 @@ def spike(values, around=None, window=15):
     return max(vals) / mean
 
 
-def find_peak(src):
-    """Time (s) of the loudest moment, or None if the clip has no clear spike."""
+def window_range(rms, window):
+    """Indices (0.1 s steps) of the original Twitch clip inside our (maybe longer) download."""
+    if not window:
+        return range(len(rms))
+    a, b = max(0, int(window[0] * 10)), min(len(rms), int(window[1] * 10))
+    return range(a, b) if b - a > 10 else range(len(rms))
+
+
+def find_peak(src, window=None):
+    """Time (s) of the loudest moment (inside the original clip), or None if no clear spike."""
     rms = rms_profile(src)
     if len(rms) < 10:
         return None
     mean = sum(rms) / len(rms)
-    peak_i = max(range(len(rms)), key=lambda i: rms[i])
+    peak_i = max(window_range(rms, window), key=lambda i: rms[i])
     if mean == 0 or rms[peak_i] / mean < 1.8:
         return None  # no real spike, effects would look random
     return max(0.0, peak_i * 0.1 - 0.05)
@@ -601,9 +700,14 @@ def tighten_clip(src, clip, cfg):
     if not cfg.get("jump_cuts", True):
         return src
     rms = rms_profile(src)
-    peak = find_peak(src)
-    if peak is None or len(rms) < 20:
-        return src                                    # no clear payoff: leave the clip alone
+    window = clip.get("_window")
+    peak = find_peak(src, window)
+    if len(rms) < 20:
+        return src
+    if peak is None:
+        if not window:
+            return src                                # no clear payoff: leave the clip alone
+        peak = (window[0] + window[1]) / 2            # extended download: centre on the original clip
     try:
         words = transcribe_words(src, cfg.get("caption_timeout", 240))
     except Exception:
@@ -801,10 +905,17 @@ def score_moment(raw, clip, cfg):
     text, words, heard = "", [], False
     try:
         words = transcribe_words(raw, cfg.get("caption_timeout", 240))
-        text = " " + " ".join(w for w, _, _ in words).lower() + " "
         heard = True
     except Exception as e:
         log(f"  (scoring without speech: {e})")
+    # find the face-cam first, so we only count what the STREAMER says (not game characters)
+    clip["_cam"] = find_facecam(raw) if cfg.get("layout", "split") == "split" else None
+    clip["_face"] = _LAST_FACE if clip["_cam"] else None
+    all_words = len(words)
+    words = streamer_words_only(words, raw, clip, cfg, quiet=True)
+    if all_words > len(words):
+        log(f"  ({all_words - len(words)} of {all_words} words were the game talking, ignored)")
+    text = " " + " ".join(w for w, _, _ in words).lower() + " "
     title = clip.get("title", "").lower()
     funny = sum(text.count(f" {w}") for w in FUNNY_WORDS) + 2 * sum(k in title for k in TITLE_FUNNY)
     fail = sum(text.count(f" {w}") for w in FAIL_WORDS)                       # 3. fails / karma
@@ -814,12 +925,12 @@ def score_moment(raw, clip, cfg):
     excite, peak_i = 0.0, None
     if len(rms) >= 10:
         mean = sum(rms) / len(rms) or 1
-        peak_i = max(range(len(rms)), key=lambda i: rms[i])
-        excite = max(0.0, max(rms) / mean - 1.5)              # 1. yelling / screaming
+        rng = window_range(rms, clip.get("_window"))         # judge the original clip part
+        peak_i = max(rng, key=lambda i: rms[i])
+        excite = max(0.0, rms[peak_i] / mean - 1.5)           # 1. yelling / screaming
         excite += sum(1 for v in rms if v > mean * 2.2) / 10   # how long it stays loud
 
     # 1. big physical reaction: the face-cam suddenly moves a lot near the loud moment
-    clip["_cam"] = find_facecam(raw) if cfg.get("layout", "split") == "split" else None
     reaction = 0.0
     if clip["_cam"]:
         x, y, w, h, _, _ = clip["_cam"]
@@ -964,6 +1075,9 @@ def find_peaks(src, n=3, gap=3.0):
     return peaks
 
 
+_LAST_FACE = None
+
+
 def find_facecam(src):
     """Never let face detection kill a clip: on any error, fall back to the blur layout."""
     try:
@@ -1032,6 +1146,8 @@ def _find_facecam(src):
     x = min(max(0, cx - cw / 2), W - cw)
     y = min(max(0, cy - ch / 2), H - ch)
     ev = lambda v: int(v) // 2 * 2
+    global _LAST_FACE
+    _LAST_FACE = (fx, fy, fw, fh)                     # the face itself (for the mouth check)
     return ev(x), ev(y), ev(cw), ev(ch), ev(W), ev(H)
 
 
@@ -1066,7 +1182,7 @@ def make_vertical(src, clip, cfg):
     clip["_split"] = bool(cam)
     last_v = "[v1]"
 
-    peaks = find_peaks(src, cfg.get("max_booms", 3)) if cfg.get("effects", True) else []
+    peaks = find_peaks(src, cfg.get("max_booms", 3)) if cfg.get("effects", False) else []
     peak = peaks[0] if peaks else None
     if peak is not None:
         T = f"{peak:.2f}"
@@ -1387,7 +1503,7 @@ def main():
     scored = []
     for c in shortlist:
         try:
-            raw = download_clip(c)
+            raw = download_clip(c, cfg)
             mode = cfg.get("nudity", "blur")
             nude = nudity_fraction(raw, cfg) if mode in ("blur", "skip") else 0.0
             too_much = nude > 0.05 if mode == "skip" else nude >= cfg.get("nudity_skip_fraction", 1.01)
@@ -1430,7 +1546,7 @@ def main():
     for clip in picked:
         try:
             log(f"processing: {clip['broadcaster_name']} — {clip['title']} ({clip['view_count']} views)")
-            raw = download_clip(clip)
+            raw = download_clip(clip, cfg)
             tight = tighten_clip(raw, clip, cfg)
             clean = tight
             if cfg.get("nudity", "blur") == "blur":
