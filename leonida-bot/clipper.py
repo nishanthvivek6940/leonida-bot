@@ -458,6 +458,39 @@ def tighten_clip(src, clip, cfg):
     return out
 
 
+# ---------------- Nudity check ----------------
+
+NUDE_CLASSES = {"BUTTOCKS_EXPOSED", "FEMALE_BREAST_EXPOSED", "FEMALE_GENITALIA_EXPOSED",
+                "MALE_GENITALIA_EXPOSED", "ANUS_EXPOSED"}   # underwear shows up as *_COVERED = fine
+_NUDE = None
+
+
+def has_nudity(src, cfg):
+    """True if the clip shows full nudity in 2+ frames (checked twice a second)."""
+    global _NUDE
+    import shutil, tempfile
+    try:
+        from nudenet import NudeDetector
+    except Exception:
+        return False                                   # tool missing: don't block posting
+    if _NUDE is None:
+        _NUDE = NudeDetector()
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        subprocess.run([ffmpeg_path(), "-v", "error", "-i", str(src), "-vf", "fps=2,scale=-2:720",
+                        str(tmp / "f%03d.jpg")], check=True, timeout=180)
+        min_score = cfg.get("nudity_min_score", 0.5)
+        hits = 0
+        for f in sorted(tmp.glob("*.jpg")):
+            if any(d["class"] in NUDE_CLASSES and d["score"] >= min_score for d in _NUDE.detect(str(f))):
+                hits += 1
+                if hits >= cfg.get("nudity_min_frames", 2):
+                    return True
+        return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ---------------- Is this clip actually good? ----------------
 
 FUNNY_WORDS = ["haha", "hahaha", "lmao", "lol", "bro", "bruh", "nah", "why", "wtf", "yo",
@@ -614,29 +647,38 @@ def find_facecam(src):
 
 
 def _find_facecam(src):
-    """Find the streamer's webcam: a face that stays in the same spot across the clip.
+    """Find the streamer's webcam: a face that keeps showing up in the same spot, near the
+    edges of the screen (game characters move around and sit in the middle; webcams don't).
     Returns (x, y, w, h, W, H) crop box in source pixels, or None."""
-    try:
-        import cv2
-    except Exception:
-        return None
+    import cv2
     cap = cv2.VideoCapture(str(src))
     n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
     W, H = cap.get(3), cap.get(4)
     if n < 10 or not W or not H:
         cap.release()
         return None
-    casc = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    front = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    side = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
+    min_face = int(H * 0.035)
+    samples = 12
     dets = []
-    for k in range(8):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(n * (k + 0.5) / 8))
+    for k in range(samples):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(n * (k + 0.5) / samples))
         ok, frame = cap.read()
         if not ok:
             continue
-        small = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        faces = casc.detectMultiScale(gray, 1.1, 6, minSize=(28, 28))
-        dets.append([(x * 2, y * 2, w * 2, h * 2) for (x, y, w, h) in faces])
+        gray = cv2.equalizeHist(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        found = list(front.detectMultiScale(gray, 1.08, 4, minSize=(min_face, min_face)))
+        found += list(side.detectMultiScale(gray, 1.08, 4, minSize=(min_face, min_face)))
+        flipped = side.detectMultiScale(cv2.flip(gray, 1), 1.08, 4, minSize=(min_face, min_face))
+        found += [(int(W - x - w), y, w, h) for (x, y, w, h) in flipped]   # faces turned the other way
+        keep = []
+        for (x, y, w, h) in found:
+            cx, cy = x + w / 2, y + h / 2
+            edge = cx < W * 0.35 or cx > W * 0.65 or cy < H * 0.28 or cy > H * 0.72
+            if edge and w < H * 0.4:
+                keep.append((int(x), int(y), int(w), int(h)))
+        dets.append(keep)
     cap.release()
     if not dets:
         return None
@@ -645,22 +687,21 @@ def _find_facecam(src):
         cx, cy = f[0] + f[2] / 2, f[1] + f[3] / 2
         hits = []
         for fs in dets:
-            m = [g for g in fs if abs(g[0] + g[2] / 2 - cx) < W * 0.05 and abs(g[1] + g[3] / 2 - cy) < H * 0.07]
+            m = [g for g in fs if abs(g[0] + g[2] / 2 - cx) < W * 0.06 and abs(g[1] + g[3] / 2 - cy) < H * 0.10]
             if m:
                 hits.append(m[0])
-        if len(hits) >= max(3, int(0.6 * len(dets))) and (best is None or len(hits) > len(best)):
+        if len(hits) >= max(3, int(0.3 * len(dets))) and (best is None or len(hits) > len(best)):
             best = hits
     if not best:
         return None                                   # no steady face = no webcam (or face hidden)
     med = lambda i: sorted(h[i] for h in best)[len(best) // 2]
     fx, fy, fw, fh = med(0), med(1), med(2), med(3)
-    if fw < H * 0.05:
-        return None                                   # too tiny to look good blown up
-    cw = min(W, fw * 3.0)
+    # crop around the face: small faces usually sit in a small cam box, so grab more around them
+    cw = min(W, max(fw * 3.0, min(W * 0.22, fw * 8.0)))
     ch = cw * 672 / 1080
     if ch > H:
         ch, cw = H, H * 1080 / 672
-    cx, cy = fx + fw / 2, fy + fh / 2 + fh * 0.25
+    cx, cy = fx + fw / 2, fy + fh / 2 + fh * 0.3
     x = min(max(0, cx - cw / 2), W - cw)
     y = min(max(0, cy - ch / 2), H - ch)
     ev = lambda v: int(v) // 2 * 2
@@ -986,9 +1027,10 @@ def main():
     clips = fetch_clips(cfg, token)
     log(f"found {len(clips)} candidate clips")
 
-    new_clips = [c for c in clips if c["id"] not in history["posted_clip_ids"]]
+    done = set(history["posted_clip_ids"]) | set(history.get("skipped_clip_ids", []))
+    new_clips = [c for c in clips if c["id"] not in done]
     if len(new_clips) < len(clips):
-        log(f"  skipping {len(clips) - len(new_clips)} already posted")
+        log(f"  skipping {len(clips) - len(new_clips)} already posted / skipped")
     max_uploads = cfg.get("max_uploads_per_run", 2)
     per_streamer = cfg.get("max_per_streamer", 1)
 
@@ -1011,6 +1053,12 @@ def main():
     for c in shortlist:
         try:
             raw = download_clip(c)
+            if cfg.get("skip_nudity", True) and has_nudity(raw, cfg):
+                log(f"  skip (nudity) {c['broadcaster_name']} - {c['title'][:50]}")
+                history.setdefault("skipped_clip_ids", []).append(c["id"])
+                save_history(history)
+                raw.unlink(missing_ok=True)
+                continue
             c["_score"], c["_category"] = score_moment(raw, c, cfg)
             log(f"  score {c['_score']:>5} [{c['_category']}] {c['broadcaster_name']} - {c['title'][:50]}")
             scored.append(c)
