@@ -3,7 +3,7 @@
   "twitch_client_secret": "set in GitHub Secrets",
 
   "game_name": "Grand Theft Auto VI",
-  "streamers": ["kaicenat", "caseoh_", "zackrawrr", "hasanabi", "plaqueboymax", "duke", "jynxzi", "xqc", "rayasianboy", "thetylilshow", "stableronaldo", "yourragegaming", "lacy", "agent00", "jasontheween", "emiru", "mizkif", "ddg", "lirik", "timthetatman", "summit1g"],
+  "streamers": ["kaicenat", "ishowspeed", "caseoh_", "zackrawrr", "hasanabi", "plaqueboymax", "duke", "jynxzi", "xqc", "rayasianboy", "thetylilshow", "stableronaldo", "yourragegaming", "lacy", "agent00", "jasontheween", "emiru", "mizkif", "lirik", "timthetatman", "summit1g"],
 "max_per_streamer": 1,
 
   "lookback_hours": 6,
