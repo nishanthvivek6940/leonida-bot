@@ -217,6 +217,49 @@ def ffmpeg_path():
     return p
 
 
+def vod_piece(video_id, a, b, out, timeout=90):
+    """Download just seconds a..b of a Twitch stream recording: find the few small video pieces
+    that cover that time and fetch only those (fast, even for a 12-hour stream)."""
+    import time
+    t0 = time.time()
+    r = subprocess.run([sys.executable, "-m", "yt_dlp", "-q", "--no-warnings", "-g",
+                        "-f", "best[height<=1080]/best", f"https://www.twitch.tv/videos/{video_id}"],
+                       capture_output=True, text=True, timeout=60)
+    url = (r.stdout.strip().splitlines() or [""])[0]
+    if r.returncode != 0 or ".m3u8" not in url:
+        raise RuntimeError("no stream recording link")
+    pl = requests.get(url, timeout=30).text
+    base = url.rsplit("/", 1)[0] + "/"
+    t, dur, picks, first_start = 0.0, None, [], None
+    for line in pl.splitlines():
+        line = line.strip()
+        if line.startswith("#EXTINF:"):
+            dur = float(line[8:].split(",")[0])
+        elif line and not line.startswith("#") and dur is not None:
+            if t + dur > a and t < b:
+                if first_start is None:
+                    first_start = t
+                picks.append(line if line.startswith("http") else base + line)
+            t += dur
+            dur = None
+            if t >= b:
+                break
+    if not picks:
+        raise RuntimeError("clip time not in the recording yet")
+    joined = out.with_suffix(".ts")
+    with open(joined, "wb") as f:
+        for u in picks:
+            if time.time() - t0 > timeout:
+                raise RuntimeError("recording download too slow")
+            seg = requests.get(u, timeout=30)
+            seg.raise_for_status()
+            f.write(seg.content)
+    subprocess.run([ffmpeg_path(), "-y", "-loglevel", "error", "-ss", f"{a - first_start:.2f}", "-i", str(joined),
+                    "-t", f"{b - a:.2f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                    "-c:a", "aac", "-b:a", "192k", str(out)], check=True, timeout=180)
+    joined.unlink(missing_ok=True)
+
+
 def download_clip(clip, cfg=None):
     """Download the clip. If the stream recording (VOD) exists, grab the clip PLUS extra seconds
     after it, so a reaction that kept going past where the clipper stopped isn't lost."""
@@ -229,18 +272,17 @@ def download_clip(clip, cfg=None):
     if extra and vid and off is not None:
         a = max(0, int(off) - before)
         b = int(off) + int(round(clip.get("duration", 30))) + extra
-        cmd = [sys.executable, "-m", "yt_dlp", "-q", "--no-warnings", "-f", "best[height<=1080]/best",
-               "--download-sections", f"*{a}-{b}", "-o", str(out), f"https://www.twitch.tv/videos/{vid}"]
         try:
-            subprocess.run(cmd, check=True, timeout=420)
+            vod_piece(vid, a, b, out, cfg.get("vod_timeout", 90))
             if out.exists() and out.stat().st_size > 200_000:
                 start = off - a                                   # where the original clip starts in our file
                 clip["_window"] = (start, start + clip.get("duration", 30))
                 log(f"  got clip + {extra}s after it from the stream recording")
                 return out
         except Exception as e:
-            log(f"  (couldn't use the stream recording: {str(e)[:80]}; using the plain clip)")
+            log(f"  (couldn't use the stream recording: {str(e)[:100]}; using the plain clip)")
         out.unlink(missing_ok=True)
+        out.with_suffix(".ts").unlink(missing_ok=True)
     cmd = [sys.executable, "-m", "yt_dlp", "-q", "--no-warnings", "-o", str(out), clip["url"]]
     subprocess.run(cmd, check=True, timeout=300)
     clip.pop("_window", None)
