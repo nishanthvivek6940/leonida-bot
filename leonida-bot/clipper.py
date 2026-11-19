@@ -491,6 +491,58 @@ def has_nudity(src, cfg):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def censor_clip(src, clip, cfg):
+    """Pixelate exposed body parts frame by frame (underwear is left alone).
+    Returns the censored file, or src unchanged if nothing needed covering."""
+    global _NUDE
+    import cv2
+    from nudenet import NudeDetector
+    if _NUDE is None:
+        _NUDE = NudeDetector()
+    min_score = cfg.get("nudity_min_score", 0.5)
+    every = cfg.get("censor_every_frames", 3)          # check every 3rd frame, hold the box in between
+    cap = cv2.VideoCapture(str(src))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    W, H = int(cap.get(3)), int(cap.get(4))
+    tmp = DOWNLOADS / f"{clip['id']}_censor_tmp.mp4"
+    out = DOWNLOADS / f"{clip['id']}_censored.mp4"
+    wr = cv2.VideoWriter(str(tmp), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+    boxes, prev, i, covered = [], [], 0, 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if i % every == 0:
+            prev, boxes = boxes, []
+            for d in _NUDE.detect(frame):
+                if d["class"] in NUDE_CLASSES and d["score"] >= min_score:
+                    boxes.append(d["box"])               # [x, y, w, h]
+        for (x, y, w, h) in boxes + prev:                # last two checks together = no flicker
+            px, py = int(w * 0.3), int(h * 0.3)          # a bit bigger than the detection
+            x0, y0 = max(0, int(x) - px), max(0, int(y) - py)
+            x1, y1 = min(W, int(x + w) + px), min(H, int(y + h) + py)
+            if x1 - x0 < 4 or y1 - y0 < 4:
+                continue
+            roi = frame[y0:y1, x0:x1]
+            small = cv2.resize(roi, (max(1, (x1 - x0) // 24), max(1, (y1 - y0) // 24)))
+            frame[y0:y1, x0:x1] = cv2.resize(small, (x1 - x0, y1 - y0), interpolation=cv2.INTER_NEAREST)
+        if boxes or prev:
+            covered += 1
+        wr.write(frame)
+        i += 1
+    cap.release()
+    wr.release()
+    if covered == 0:
+        tmp.unlink(missing_ok=True)
+        return src
+    subprocess.run([ffmpeg_path(), "-y", "-loglevel", "error", "-i", str(tmp), "-i", str(src),
+                    "-map", "0:v", "-map", "1:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                    "-c:a", "copy", "-shortest", str(out)], check=True, timeout=600)
+    tmp.unlink(missing_ok=True)
+    log(f"  censored nudity in {covered / fps:.1f}s of the clip")
+    return out
+
+
 # ---------------- Is this clip actually good? ----------------
 
 FUNNY_WORDS = ["haha", "hahaha", "lmao", "lol", "bro", "bruh", "nah", "why", "wtf", "yo",
@@ -1053,7 +1105,7 @@ def main():
     for c in shortlist:
         try:
             raw = download_clip(c)
-            if cfg.get("skip_nudity", True) and has_nudity(raw, cfg):
+            if cfg.get("nudity", "blur") == "skip" and has_nudity(raw, cfg):
                 log(f"  skip (nudity) {c['broadcaster_name']} - {c['title'][:50]}")
                 history.setdefault("skipped_clip_ids", []).append(c["id"])
                 save_history(history)
@@ -1092,7 +1144,13 @@ def main():
             log(f"processing: {clip['broadcaster_name']} — {clip['title']} ({clip['view_count']} views)")
             raw = download_clip(clip)
             tight = tighten_clip(raw, clip, cfg)
-            short = make_vertical(tight, clip, cfg)
+            clean = tight
+            if cfg.get("nudity", "blur") == "blur":
+                try:
+                    clean = censor_clip(tight, clip, cfg)
+                except ImportError:
+                    pass                                  # tool missing: post as-is
+            short = make_vertical(clean, clip, cfg)
             if args.dry_run:
                 log(f"dry run — short built at {short}")
             else:
@@ -1109,8 +1167,8 @@ def main():
                 history["posted_clip_ids"].append(clip["id"])
                 save_history(history)
             raw.unlink(missing_ok=True)  # keep disk clean, keep the short
-            if tight != raw:
-                Path(tight).unlink(missing_ok=True)
+            for f in {tight, clean} - {raw}:
+                Path(f).unlink(missing_ok=True)
         except Exception as e:
             log(f"ERROR on clip {clip['id']}: {e}")
 
