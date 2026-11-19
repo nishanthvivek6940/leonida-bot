@@ -312,6 +312,18 @@ def transcribe_words(src, timeout=240):
     return [tuple(w) for w in json.loads(r.stdout.strip().splitlines()[-1])]
 
 
+SWEARS = ["fuck", "shit", "bitch", "nigga", "nigger", "cunt", "pussy", "whore", "slut", "fag"]
+
+
+def clean_word(w):
+    """F***ING instead of the full swear (keeps reach up on YouTube/Instagram)."""
+    def bleep(m):
+        word = m.group(0)
+        return word[0] + "*" * (len(word) - 1)
+    pat = r"\b\w*(" + "|".join(SWEARS) + r")\w*"
+    return re.sub(pat, bleep, w, flags=re.IGNORECASE)
+
+
 def _ass_time(t):
     h = int(t // 3600); m = int(t % 3600 // 60); s = t % 60
     return f"{h}:{m:02d}:{s:05.2f}"
@@ -340,7 +352,7 @@ def build_ass(words, out_path):
             longest = max(range(len(chunk)), key=lambda j: len(chunk[j][0]))
             parts = []
             for j, (cw, _, _) in enumerate(chunk):
-                txt = cw.upper().replace("{", "").replace("}", "")
+                txt = clean_word(cw).upper().replace("{", "").replace("}", "")
                 if j == longest and len(chunk) > 1:
                     parts.append(r"{\c&H00DFFF&}" + txt + r"{\c&HFFFFFF&}")
                 else:
@@ -401,16 +413,40 @@ def find_peak(src):
     return max(0.0, peak_i * 0.1 - 0.05)
 
 
-def plan_cuts(rms, peak, cfg):
+def snap_to_speech(start, end, words, dur, cfg):
+    """Don't start or end in the middle of someone talking: let the sentence finish."""
+    if not words:
+        return start, end
+    gap = 0.7                                         # a pause this long = sentence over
+    max_extra = cfg.get("max_finish_seconds", 8)      # never drag on more than this past the payoff window
+    limit = min(dur, end + max_extra)
+    talking = True
+    while talking:
+        talking = False
+        for w, a, b in words:
+            if a < end + gap and b > end and b <= limit:   # someone still talking at the cut
+                end = min(limit, b + 0.4)
+                talking = True
+    for w, a, b in words:                             # start at the beginning of a sentence
+        if a < start < b + gap:
+            start = max(0.0, a - 0.2)
+    return round(start, 2), round(end, 2)
+
+
+def plan_cuts(rms, peak, cfg, words=None):
     """Which parts of the clip to keep: short build-up, the payoff, the reaction; no dead air."""
     dur = len(rms) * 0.1
     pre = cfg.get("max_buildup_seconds", 10)
-    post = cfg.get("after_payoff_seconds", 4)
+    post = cfg.get("after_payoff_seconds", 5)
     start, end = max(0.0, peak - pre), min(dur, peak + post)
+    start, end = snap_to_speech(start, end, words, dur, cfg)
 
     # dead air = quiet stretches before the payoff (quiet = under 35% of the clip's average loudness)
     mean = sum(rms) / len(rms)
     quiet = [v < mean * 0.35 for v in rms]
+    for w, a, b in words or []:                       # speech is never dead air
+        for k in range(max(0, int(a * 10)), min(len(quiet), int(b * 10) + 1)):
+            quiet[k] = False
     min_gap = cfg.get("min_dead_air_seconds", 0.8)
     keep, cur = [], start
     i = int(start * 10)
@@ -442,7 +478,11 @@ def tighten_clip(src, clip, cfg):
     peak = find_peak(src)
     if peak is None or len(rms) < 20:
         return src                                    # no clear payoff: leave the clip alone
-    keep = plan_cuts(rms, peak, cfg)
+    try:
+        words = transcribe_words(src, cfg.get("caption_timeout", 240))
+    except Exception:
+        words = []
+    keep = plan_cuts(rms, peak, cfg, words)
     dur = len(rms) * 0.1
     if len(keep) == 1 and keep[0][0] < 0.3 and keep[0][1] > dur - 0.3:
         return src                                    # nothing worth cutting
@@ -487,6 +527,31 @@ def has_nudity(src, cfg):
                 if hits >= cfg.get("nudity_min_frames", 2):
                     return True
         return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def nudity_fraction(src, cfg):
+    """Share of the clip (0-1) that shows full nudity, checked twice a second."""
+    global _NUDE
+    import shutil, tempfile
+    try:
+        from nudenet import NudeDetector
+    except Exception:
+        return 0.0
+    if _NUDE is None:
+        _NUDE = NudeDetector()
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        subprocess.run([ffmpeg_path(), "-v", "error", "-i", str(src), "-vf", "fps=2,scale=-2:720",
+                        str(tmp / "f%03d.jpg")], check=True, timeout=180)
+        frames = sorted(tmp.glob("*.jpg"))
+        if not frames:
+            return 0.0
+        min_score = cfg.get("nudity_min_score", 0.5)
+        hits = sum(1 for f in frames
+                   if any(d["class"] in NUDE_CLASSES and d["score"] >= min_score for d in _NUDE.detect(str(f))))
+        return hits / len(frames)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -584,7 +649,10 @@ def score_moment(raw, clip, cfg):
         category = "funny"
     ladder = {0: 4, 1: 1.5}.get(clip.get("_tier", 2), 0)        # ranked + live streamers still get a head start
     ladder += max(0, 2 - clip.get("_rank", 999) * 0.1)          # higher on your list = small bonus
-    score = moment + ladder + math.log10(max(clip["view_count"], 1))
+    # clips with the streamer's face-cam make much better shorts (split screen + their reaction)
+    clip["_cam"] = find_facecam(raw) if cfg.get("layout", "split") == "split" else None
+    cam_bonus = cfg.get("facecam_bonus", 4) if clip["_cam"] else 0
+    score = moment + ladder + cam_bonus + math.log10(max(clip["view_count"], 1))
     return round(score, 1), category
 
 
@@ -635,6 +703,7 @@ def pick_hook(clip):
         hook = t.format(name=display.upper())
         text = t.format(name="{N}").lower()
         text = (text[0].upper() + text[1:]).replace("{n}", display)
+    hook, text = clean_word(hook), clean_word(text)
     clip["_hook"], clip["_title_text"] = hook, text
     return hook, text
 
@@ -1105,14 +1174,18 @@ def main():
     for c in shortlist:
         try:
             raw = download_clip(c)
-            if cfg.get("nudity", "blur") == "skip" and has_nudity(raw, cfg):
-                log(f"  skip (nudity) {c['broadcaster_name']} - {c['title'][:50]}")
+            mode = cfg.get("nudity", "blur")
+            nude = nudity_fraction(raw, cfg) if mode in ("blur", "skip") else 0.0
+            too_much = nude > 0.05 if mode == "skip" else nude >= cfg.get("nudity_skip_fraction", 1.01)
+            if too_much:                                  # mostly nude (strip club etc.) = skip; a quick moment gets blurred later
+                log(f"  skip (nudity in {nude:.0%} of clip) {c['broadcaster_name']} - {c['title'][:50]}")
                 history.setdefault("skipped_clip_ids", []).append(c["id"])
                 save_history(history)
                 raw.unlink(missing_ok=True)
                 continue
             c["_score"], c["_category"] = score_moment(raw, c, cfg)
-            log(f"  score {c['_score']:>5} [{c['_category']}] {c['broadcaster_name']} - {c['title'][:50]}")
+            cam = "cam" if c.get("_cam") else "no cam"
+            log(f"  score {c['_score']:>5} [{c['_category']}, {cam}] {c['broadcaster_name']} - {c['title'][:50]}")
             scored.append(c)
         except Exception as e:
             log(f"  skip {c['id']}: {e}")
