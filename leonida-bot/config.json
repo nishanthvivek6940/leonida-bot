@@ -6,6 +6,7 @@
   "streamers": ["kaicenat", "ishowspeed", "caseoh_", "zackrawrr", "hasanabi", "plaqueboymax", "duke", "jynxzi", "xqc", "rayasianboy", "thetylilshow", "stableronaldo", "yourragegaming", "lacy", "agent00", "jasontheween", "emiru", "mizkif", "lirik", "timthetatman", "summit1g"],
 "max_per_streamer": 1,
 "min_short_seconds": 12,
+  "instagram": false,
   "min_fresh_views": 50,
 "fallback_lookback_hours": 24,
   "lookback_hours": 3,
