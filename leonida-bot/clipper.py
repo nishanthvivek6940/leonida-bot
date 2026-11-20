@@ -1755,6 +1755,18 @@ def main():
     SHORTS.mkdir(exist_ok=True)
 
     log("=== run started ===")
+    if not args.dry_run:
+        now = datetime.now(timezone.utc)
+        until = history.get("yt_cooldown_until")
+        if until and datetime.fromisoformat(until) > now:
+            log(f"YouTube's daily upload limit was hit - pausing until {until[:16]} UTC (saves GitHub minutes)")
+            return
+        recent = [t for t in history.get("upload_times", [])
+                  if now - datetime.fromisoformat(t) < timedelta(hours=24)]
+        cap = cfg.get("max_uploads_per_day", 10)
+        if len(recent) >= cap:
+            log(f"already posted {len(recent)} shorts in the last 24h (limit {cap}) - skipping this run")
+            return
     token = twitch_token(cfg)
     clips = fetch_clips(cfg, token)
     done = set(history["posted_clip_ids"]) | set(history.get("skipped_clip_ids", []))
@@ -1845,8 +1857,18 @@ def main():
             if args.dry_run:
                 log(f"dry run — short built at {short}")
             else:
-                vid = upload_short(yt, short, clip, cfg)
+                try:
+                    vid = upload_short(yt, short, clip, cfg)
+                except Exception as e:
+                    if "uploadLimitExceeded" in str(e) or "exceeded the number of videos" in str(e):
+                        pause = cfg.get("limit_pause_hours", 12)
+                        history["yt_cooldown_until"] = (datetime.now(timezone.utc) + timedelta(hours=pause)).isoformat()
+                        save_history(history)
+                        log(f"YouTube says the channel hit its daily upload limit - pausing uploads for {pause}h")
+                        break
+                    raise
                 log(f"uploaded: https://youtube.com/shorts/{vid}")
+                history["upload_times"] = (history.get("upload_times", []) + [datetime.now(timezone.utc).isoformat()])[-60:]
                 ok_ig, why = instagram_safe(clip, cfg)
                 if instagram_enabled(cfg) and not ok_ig:
                     log(f"instagram: skipped this one ({why}) - Instagram strikes sexual content even blurred")
