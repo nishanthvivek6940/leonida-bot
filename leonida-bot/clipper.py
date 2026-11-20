@@ -474,12 +474,14 @@ def game_subtitle_profile(src):
             if scale != 1:
                 band = cv2.resize(band, (0, 0), fx=scale, fy=scale)
             n, _, st, _ = cv2.connectedComponentsWithStats((band > 190).astype(np.uint8))
-            ys = [sy + sh / 2 for sx, sy, sw, sh, sa in st[1:] if 3 <= sh <= 30 and sw <= 40 and sa >= 4]
-            if len(ys) >= 6:                              # letters sitting on one line = a subtitle
-                mid = sorted(ys)[len(ys) // 2]
-                last = sum(1 for y in ys if abs(y - mid) <= 14) >= 6
-            else:
-                last = False
+            pts = [(sx + sw / 2, sy + sh / 2) for sx, sy, sw, sh, sa in st[1:] if 3 <= sh <= 30 and sw <= 40 and sa >= 4]
+            last = False
+            if len(pts) >= 6:                             # letters on one line, centred = a game subtitle
+                mid = sorted(p[1] for p in pts)[len(pts) // 2]
+                row = [p[0] for p in pts if abs(p[1] - mid) <= 14]
+                if len(row) >= 6:
+                    centre = (min(row) + max(row)) / 2 / band.shape[1]
+                    last = 0.4 <= centre <= 0.6          # chat/alert overlays sit to one side
         t = i / fps
         while len(out) < int(t * 10) + 1:
             out.append(last)
@@ -535,14 +537,19 @@ def _drop_game_lines(words, subs, motion, is_game, quiet):
     for ln in lines:
         a, b = int(ln[0][1] * 10), int(ln[-1][2] * 10) + 1
         sub = subs[a:b]
-        if sub and sum(sub) / len(sub) >= 0.4:          # game subtitle on screen = a character said it
-            dropped += 1
-            continue
+        subtitle_up = bool(sub) and sum(sub) / len(sub) >= 0.4
         seg = motion[a:b]
-        if seg and is_game(sum(seg) / len(seg)):         # streamer's mouth/face still = not them
+        if motion:                                       # we can see the streamer: need BOTH signs
+            quiet = bool(seg) and is_game(sum(seg) / len(seg))
+            if subtitle_up and quiet:
+                dropped += 1
+                continue
+        elif subtitle_up:                                # no cam: the subtitle is all we have
             dropped += 1
             continue
         keep += ln
+    if words and len(keep) < 0.2 * len(words) and motion:
+        keep, dropped = [w for ln in lines for w in ln], 0   # dropping almost everything = filter's wrong
     if dropped and not quiet:
         log(f"  captions: skipped {dropped} game-voice line(s)")
     return keep
@@ -704,6 +711,10 @@ def plan_cuts(rms, peak, cfg, words=None, motion=None, face=None):
     start, end = snap_to_speech(start, end, words, dur, cfg)
     end = let_it_finish(end, rms, dur, cfg, motion, face)
     start, end = snap_to_speech(start, end, words, dur, cfg)
+    longest = cfg.get("max_short_seconds", 35)           # funny shorts are short
+    if end - start > longest:
+        start = max(start, min(peak - 3, end - longest))  # trim build-up first, keep the payoff + reaction
+        end = min(end, start + longest)
 
     # dead air = quiet stretches before the payoff (quiet = under 35% of the clip's average loudness)
     mean = sum(rms) / len(rms)
@@ -1437,11 +1448,22 @@ def ai_meme_caption(src, clip, cfg):
     body = {"model": cfg.get("ai_model", "openai/gpt-4o-mini"), "temperature": 0.9,
             "messages": [{"role": "system", "content": AI_STYLE}, {"role": "user", "content": content}]}
     try:
-        r = requests.post(AI_URL, json=body, timeout=60, headers={
-            "Authorization": f"Bearer {token}", "Content-Type": "application/json",
-            "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"})
-        r.raise_for_status()
-        txt = r.json()["choices"][0]["message"]["content"]
+        txt, last = None, ""
+        tries = [(cfg.get("ai_model", "openai/gpt-4o-mini"), content),
+                 ("openai/gpt-4.1-mini", content),
+                 ("openai/gpt-4o-mini", [content[0]])]            # last try: text only, no pictures
+        for model, msg in tries:
+            body["model"], body["messages"][1]["content"] = model, msg
+            r = requests.post(AI_URL, json=body, timeout=60, headers={
+                "Authorization": f"Bearer {token}", "Content-Type": "application/json",
+                "Accept": "application/json"})
+            try:
+                txt = r.json()["choices"][0]["message"]["content"]
+                break
+            except Exception:
+                last = f"{model}: HTTP {r.status_code} {r.headers.get('content-type', '')} {r.text[:150]!r}"
+        if txt is None:
+            raise RuntimeError(last)
         m = re.search(r"\{.*\}", txt, re.S)
         data = json.loads(m.group(0)) if m else {}
         hook = clean_word(str(data.get("hook", "")).strip().strip('"'))
@@ -1451,7 +1473,7 @@ def ai_meme_caption(src, clip, cfg):
         log(f"  AI caption: {hook}")
         return hook, title[:100]
     except Exception as e:
-        log(f"  (AI caption failed: {str(e)[:120]}; using the normal hook)")
+        log(f"  (AI caption failed: {str(e)[:300]}; using the normal hook)")
         return None
 
 
